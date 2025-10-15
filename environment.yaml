@@ -1,0 +1,31 @@
+name: tsfm
+channels: [pytorch, nvidia, conda-forge]
+dependencies:
+  - python=3.11
+  - pytorch-cuda=12.1
+  - pytorch=2.4.*
+  - pip
+  - pip:
+      # Core HF + utils
+      - transformers>=4.44
+      - accelerate>=0.33
+      - huggingface_hub>=0.24
+      - datasets>=2.20
+      - einops
+      - bitsandbytes
+      # Time-series FMs
+      - chronos-forecasting # Amazon Chronos (pip pkg for HF Chronos)  🔗
+      - timesfm # Google TimesFM                           🔗
+      - nixtla # TimeGPT client                           🔗
+      - momentfm # MOMENT (Microsoft)                       🔗
+      # Classical + data wrangling
+      - numpy>=1.26
+      - pandas>=2.2
+      - matplotlib
+      - scikit-learn
+      - statsmodels
+      - gluonts>=0.14
+      - polars[pyarrow]
+      # Jupyter
+      - ipykernel
+      - jupyterlab
