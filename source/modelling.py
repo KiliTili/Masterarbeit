@@ -810,7 +810,292 @@ def flowstate_oos(
 
     r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
     return r2, trues, preds,pd.DatetimeIndex(oos_dates)
+def tabpfn_oos_fit_each_step(
+    data: pd.DataFrame,
+    variables=("d/p", "tms", "dfy"),   # predictors to use
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    start_date="1927-01-01",
+    lag=1,                             # create v_lag1..v_lag{lag}
+    min_train=120,                     # require at least N training rows
+    ct_cutoff=False,                   # Campbell–Thompson clamp at 0
+    quiet=False,
+    model_name="TabPFN (fit each step)",
+    model_params=None,                 # e.g. {"N_ensemble_configurations":8}
+):
+    """
+    Expanding-window OOS with TabPFNRegressor, re-fitting at every step.
+
+    Steps per month t >= start_oos:
+      - Training window = all rows up to t-1 (strictly past)
+      - Drop NaNs in features/target
+      - Fit TabPFNRegressor on (X_train, y_train)
+      - Predict y_hat at time t using lagged features
+    Returns: (r2, y_true, y_pred, dates)
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+    try:
+        from tabpfn import TabPFNRegressor
+    except Exception as e:
+        raise RuntimeError(
+            "TabPFN not installed. Please `pip install tabpfn`."
+        ) from e
+
+    if model_params is None:
+        model_params = {}
+    # sensible defaults
+    default_params = dict(N_ensemble_configurations=8)
+    default_params.update(model_params)
+
+    # ---------- data prep ----------
+    df = data.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+
+    if target_col not in df.columns:
+        raise ValueError(f"'{target_col}' not found in data.")
+    for v in variables:
+        if v not in df.columns:
+            raise ValueError(f"Predictor '{v}' not found in data.")
+
+    # create lag features 1..lag
+    for L in range(1, lag + 1):
+        for v in variables:
+            df[f"{v}_lag{L}"] = df[v].shift(L)
+
+    # feature list
+    feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
+
+    start_oos = pd.Timestamp(start_oos)
+    loop_dates = df.index[df.index >= start_oos]
+
+    preds, trues, oos_dates = [], [], []
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    for date_t in loop_dates:
+        pos = df.index.get_loc(date_t)
+
+        # strictly past data up to t-1
+        est = df.iloc[:pos].copy()
+
+        # drop rows with any NaNs in features or target
+        est = est.dropna(subset=feature_cols + [target_col])
+        if len(est) < min_train:
+            continue
+
+        X_train = est[feature_cols].to_numpy(dtype=float)
+        y_train = est[target_col].to_numpy(dtype=float)
+
+        # features for prediction at t
+        if df.loc[date_t, feature_cols].isna().any():
+            continue
+        X_pred = df.loc[date_t, feature_cols].to_numpy(dtype=float).reshape(1, -1)
+        y_true = float(df.loc[date_t, target_col])
+
+        # fit TabPFN *this step*
+        model = TabPFNRegressor(device=device, **default_params)
+        model.fit(X_train, y_train)
+
+        # predict
+        y_hat = float(model.predict(X_pred)[0])
+        if ct_cutoff:
+            y_hat = max(y_hat, 0.0)
+
+        preds.append(y_hat)
+        trues.append(y_true)
+        oos_dates.append(date_t)
+
+    if not preds:
+        raise RuntimeError("No valid TabPFN predictions. Check lags/min_train/start_oos/data coverage.")
+
+    trues = np.asarray(trues, float)
+    preds = np.asarray(preds, float)
+    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
+    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
 
 
+def tabpfn_ts_oos_fit_each_step(
+    data: pd.DataFrame,
+    target_col: str = "equity_premium",
+    start_oos: str = "1965-01-01",
+    ctx: int = 240,                 # context length (months)
+    freq: str = "M",                # "M" or "MS"
+    min_windows: int = 120,         # require at least this many training windows before 1st OOS
+    ct_cutoff: bool = False,        # Campbell–Thompson clamp at 0
+    quiet: bool = False,
+    model_name: str = "TabPFN-TS (fit each step)",
+    forecaster_repo: str = "tabpfn/tabpfn-ts",  # HF repo or local model id
+    fit_kwargs: dict | None = None,             # e.g., {"epochs": 1}
+):
+    """
+    Expanding-window, one-step-ahead OOS using TabPFN-TS, *retraining at every step*.
+
+    For each OOS date t:
+      - Build training windows from the past (length=ctx), targets are next step.
+      - Instantiate a fresh TabPFN-TS forecaster.
+      - If `.fit` exists: fit on (contexts, targets), then predict at t.
+        Else: zero-shot predict from pretrained checkpoint.
+    Returns: (r2, y_true, y_pred, dates)
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    # -------- imports / model handle --------
+    try:
+        from tabpfn_ts import TabPFNForecaster
+    except Exception as e:
+        raise RuntimeError(
+            "tabpfn-ts not found. Install it first (e.g., `pip install tabpfn-ts`)."
+        ) from e
+
+    if fit_kwargs is None:
+        fit_kwargs = {}  # lightweight defaults
+
+    # -------- data prep (monthly align like FlowState) --------
+    df = data.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    if target_col not in df.columns:
+        raise ValueError(f"'{target_col}' not found.")
+
+    def align_monthly(series: pd.DataFrame, f: str) -> pd.DataFrame:
+        z = series.copy()
+        z.index = z.index.to_period(f).to_timestamp(f)
+        z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(f)
+        z[target_col] = z[target_col].ffill()
+        return z
+
+    s = align_monthly(df[[target_col]], freq if freq in {"M", "MS"} else "M")
+    if s[target_col].isna().all() and freq in {"M", "MS"}:
+        alt = "M" if freq == "MS" else "MS"
+        s = align_monthly(df[[target_col]], alt)
+        if not quiet:
+            print(f"[TabPFN-TS] Retried with freq='{alt}' because '{freq}' produced all-NaN.")
+        freq = alt
+
+    y = s[target_col].astype("float32")
+    if y.isna().all():
+        raise ValueError("Target is all NaN after preprocessing/alignment.")
+
+    # snap OOS start to grid
+    start_oos = pd.Timestamp(start_oos)
+    if freq in {"M", "MS"}:
+        start_oos = start_oos.to_period(freq).to_timestamp(freq)
+
+    # ensure first OOS date exists on index
+    if start_oos < y.index.min():
+        start_oos = y.index.min()
+
+    test_idx = y.index[y.index >= start_oos]
+
+    if not quiet:
+        print(f"[TabPFN-TS] freq={freq} | rows={len(y)} | first={y.index.min().date()} | last={y.index.max().date()}")
+        print(f"[TabPFN-TS] start_oos={start_oos.date()} | ctx={ctx} | min_windows={min_windows} | tests={len(test_idx)}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    preds, trues, oos_dates = [], [], []
+
+    # -------- helper to build sliding windows --------
+    def build_windows(arr: np.ndarray, end_pos: int, w: int):
+        """
+        Build contexts (N, w, 1) and targets (N,) from arr[:end_pos].
+        contexts[i] = arr[i : i+w], target[i] = arr[i+w]
+        """
+        N = end_pos - w
+        if N <= 0:
+            return None, None
+        X = np.lib.stride_tricks.sliding_window_view(arr[:end_pos], window_shape=w, axis=0)  # (N, w)
+        X = X.astype("float32")[..., None]  # (N, w, 1)
+        y_next = arr[w:end_pos].astype("float32")  # length N
+        return X, y_next
+
+    # -------- expanding loop --------
+    for date_t in test_idx:
+        pos = y.index.get_loc(date_t)
+        if isinstance(pos, slice):
+            pos = pos.start
+
+        # need at least ctx for context + some windows to train
+        if pos < ctx + min_windows:
+            continue
+
+        # training windows from strictly past
+        contexts, targets = build_windows(y.values, end_pos=pos, w=ctx)
+        if contexts is None or len(contexts) < min_windows:
+            continue
+        if np.isnan(contexts).any() or np.isnan(targets).any():
+            continue
+
+        # last context (predict at t)
+        ctx_last = y.values[pos - ctx: pos].astype("float32")[None, :, None]  # (1, ctx, 1)
+        if np.isnan(ctx_last).any():
+            continue
+
+        # fresh forecaster this step
+        # try pretrained init; if your build prefers a plain constructor, swap this line:
+        #   model = TabPFNForecaster()
+        try:
+            model = TabPFNForecaster.from_pretrained(forecaster_repo).to(device)
+        except Exception:
+            model = TabPFNForecaster().to(device)
+
+        model.eval()
+
+        # If the forecaster exposes .fit, fine-tune on sliding windows
+        did_fit = False
+        if hasattr(model, "fit"):
+            try:
+                # fit expects (contexts, targets); adapt if your build needs a dict/dataloader
+                model.fit(
+                    contexts=contexts,   # (N, ctx, 1)
+                    targets=targets,     # (N,)
+                    **fit_kwargs
+                )
+                did_fit = True
+            except Exception as e:
+                if not quiet:
+                    print(f"[TabPFN-TS] fit failed at {date_t.date()}: {e}")
+
+        # Predict next step
+        with torch.inference_mode():
+            # Some builds accept numpy; others want tensors
+            try:
+                out = model.predict(ctx_last)  # (1, 1)
+            except Exception:
+                ctx_tensor = torch.tensor(ctx_last, dtype=torch.float32, device=device)
+                out = model.predict(ctx_tensor)  # (1, 1)
+                if isinstance(out, torch.Tensor):
+                    out = out.detach().cpu().numpy()
+
+        y_hat = float(np.asarray(out).reshape(-1)[0])
+        if ct_cutoff:
+            y_hat = max(y_hat, 0.0)
+
+        y_true = float(y.iloc[pos])
+        if np.isnan(y_true) or np.isnan(y_hat):
+            continue
+
+        preds.append(y_hat)
+        trues.append(y_true)
+        oos_dates.append(date_t)
+
+        if not quiet and (len(oos_dates) % 60 == 0):
+            print(f"[TabPFN-TS] progress: {len(oos_dates)} OOS preds...")
+
+    if not preds:
+        raise RuntimeError("No valid TabPFN-TS predictions; check ctx/min_windows/start_oos or package API.")
+
+    trues = np.asarray(trues, float)
+    preds = np.asarray(preds, float)
+    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
+    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
 
     #missing: CT truncation, 20 years after the series begins (≥1946), they recompute any filter/coefficients expanding in time.
