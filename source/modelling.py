@@ -1,59 +1,76 @@
 from math import inf
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
-from chronos import BaseChronosPipeline
-import torch
-import timesfm
-from gluonts.dataset.common import ListDataset
-from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
-import matplotlib.pyplot as plt
+from typing import Callable, Sequence, Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
+
+import torch
+
+
+# ================================================================
+# 1. COMMON UTILITIES
+# ================================================================
+
+def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False):
+    """
+    Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
+    using the expanding mean as the benchmark forecast.
+    """
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+
+    m = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    y_true, y_pred = y_true[m], y_pred[m]
+
+    if len(y_true) == 0:
+        if not quiet:
+            print(f"[{model_name}] No valid predictions (all NaN).")
+        return np.nan
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+
+    mean_forecast = np.array([y_true[:i].mean() for i in range(1, len(y_true)+1)])
+    denom = np.sum((y_true - mean_forecast) ** 2)
+    r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom) if denom > 0 else np.nan
+
+    if not quiet:
+        print(f"[{model_name}] Device={device} | Valid months={len(y_true)} | "
+              f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
+
+    return r2_oos
+
 
 def plot_oos(
     y_true,
     y_pred,
-    dates=None,                 # optional: pandas.DatetimeIndex or list-like of same length
-    title="Out-of-sample 1-step forecast",
+    dates=None,
+    title="Out-of-sample forecast",
     ylabel="Equity premium",
-    save_path=None,             # optional: path to save the figure
+    save_path=None,
     show=True,
 ):
     """
-    Plots true values, 1-step predictions, and the expanding-mean baseline
-    (the same mean used in evaluate_oos).
-
-    Parameters
-    ----------
-    y_true : array-like
-    y_pred : array-like
-    dates  : array-like of timestamps, optional
+    Plot true values, model predictions, and expanding-mean benchmark.
+    Assumes 1-step-ahead series (use horizon=1 slice if you did multi-step).
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-
-    # mask any NaNs in either array (should be rare after your evaluate function)
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
     m = ~np.isnan(y_true) & ~np.isnan(y_pred)
     y_true, y_pred = y_true[m], y_pred[m]
 
-    # expanding-mean baseline (same as in evaluate_oos)
-    # fast cumulative mean: mean_t = cumsum[:t] / t
     csum = np.cumsum(y_true)
     mean_forecast = csum / np.arange(1, len(y_true) + 1)
 
-    # build x-axis
     if dates is not None:
         x = pd.to_datetime(pd.Index(dates))[m]
     else:
         x = np.arange(len(y_true))
 
-    # ---- plot ----
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(x, y_true, label="True")
     ax.plot(x, y_pred, label="Prediction")
@@ -63,145 +80,346 @@ def plot_oos(
     ax.set_xlabel("Date" if dates is not None else "OOS step")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
+    fig.tight_layout()
 
-    if save_path:
-        fig.tight_layout()
+    if save_path is not None:
         fig.savefig(save_path, dpi=150)
-
     if show:
         plt.show()
     else:
         plt.close(fig)
 
 
-def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    m = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_true, y_pred = y_true[m], y_pred[m]
-    if len(y_true) == 0:
-        if not quiet:
-            print(f"[{model_name}] No valid predictions (all NaN).")
-        return np.nan
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    mean_forecast = np.array([y_true[:i].mean() for i in range(1, len(y_true)+1)])
-    r2_oos = 1 - np.sum((y_true - y_pred)**2) / np.sum((y_true - mean_forecast)**2)
-    if not quiet:
-        print(f"[{model_name}] Device={device} | Valid months={len(y_true)} | "
-              f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
-    return r2_oos
-
-def linear_regression_oos(
-    data,
-    variables=['d/p'],
-    start_oos='1965-01-01',
-    device='cpu',
-    quiet=False,
-    lag=1,
-    start_date='1927-01-01'
-):
-    """
-    Expanding-window OLS with lagged predictors.
-    Now returns (r2_oos, y_true, y_pred, dates) for plotting.
-    """
-    df = data.copy()
-
-    # ensure DatetimeIndex and date filtering
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure df.index is a DatetimeIndex and sorted."""
+    df = df.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+
+def align_monthly(series: pd.DataFrame, freq: str = "MS", col: str | None = None) -> pd.DataFrame:
+    """
+    Align a single-column DataFrame to monthly frequency with ffill.
+    freq: "M" (month-end) or "MS" (month-start).
+    """
+    z = series.copy()
+    if col is None:
+        if z.shape[1] != 1:
+            raise ValueError("align_monthly expects a single-column DataFrame or pass col.")
+        col = z.columns[0]
+    z.index = z.index.to_period(freq).to_timestamp(freq)
+    z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(freq)
+    z[col] = z[col].ffill()
+    return z
+
+
+def ct_truncate(x: float | np.ndarray) -> float | np.ndarray:
+    """Campbell–Thompson truncation at 0."""
+    return np.maximum(x, 0.0)
+
+
+def expand_start_with_min_history(
+    index: pd.DatetimeIndex,
+    start_oos: str | pd.Timestamp,
+    min_history_months: int,
+) -> pd.Timestamp:
+    """
+    Ensure at least min_history_months of past data before first OOS point.
+    """
+    start_oos = pd.Timestamp(start_oos)
+    if start_oos < index.min():
+        start_oos = index.min()
+
+    pos0 = index.get_indexer([start_oos], method="backfill")[0]
+    while pos0 < min_history_months and pos0 < len(index):
+        pos0 += 1
+
+    if pos0 >= len(index):
+        raise ValueError("No valid OOS start date with sufficient history.")
+    return index[pos0]
+
+
+# ================================================================
+# 2. GENERIC EXPANDING OOS DRIVERS
+# ================================================================
+
+def expanding_oos_tabular(
+    data: pd.DataFrame,
+    target_col: str = "equity_premium",
+    feature_cols: Sequence[str] | None = None,
+    start_oos: str = "1965-01-01",
+    start_date: str = "1927-01-01",
+    min_train: int = 120,
+    min_history_months: int | None = None,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str = "Model",
+    model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
+) -> Tuple[float, np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """
+    Generic expanding-window OOS driver for tabular models (1-step ahead).
+    """
+    if model_fit_predict_fn is None:
+        raise ValueError("You must supply model_fit_predict_fn.")
+
+    df = ensure_datetime_index(data)
     df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
-    # create lagged features: 1..lag
+    if target_col not in df.columns:
+        raise ValueError(f"'{target_col}' not found in data.")
+
+    if feature_cols is not None:
+        missing = [c for c in feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing feature columns: {missing}")
+
+    if min_history_months is not None:
+        start_ts = expand_start_with_min_history(df.index, start_oos, min_history_months)
+    else:
+        start_ts = pd.Timestamp(start_oos)
+
+    loop_dates = df.index[df.index >= start_ts]
+
+    preds, trues, oos_dates = [], [], []
+
+    for date_t in loop_dates:
+        pos = df.index.get_loc(date_t)
+        est = df.iloc[:pos].copy()        # strictly past
+        row_t = df.iloc[pos]
+
+        if est[target_col].notna().sum() < min_train:
+            continue
+
+        y_true = float(row_t[target_col])
+        if np.isnan(y_true):
+            continue
+
+        y_hat = model_fit_predict_fn(est, row_t)
+        if y_hat is None or np.isnan(y_hat):
+            continue
+
+        if ct_cutoff:
+            y_hat = float(ct_truncate(y_hat))
+
+        preds.append(float(y_hat))
+        trues.append(y_true)
+        oos_dates.append(date_t)
+
+    if not preds:
+        raise RuntimeError(f"[{model_name}] No valid predictions produced.")
+
+    trues = np.asarray(trues, float)
+    preds = np.asarray(preds, float)
+    r2 = evaluate_oos(trues, preds, model_name=model_name, device="cpu", quiet=quiet)
+    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
+
+
+def expanding_oos_univariate(
+    y: pd.Series,
+    start_oos: str = "1965-01-01",
+    prediction_length: int = 1,
+    min_history_months: int = 240,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str = "TS-Model",
+    forecast_multi_step_fn: Callable[[pd.Series, pd.Timestamp, int], np.ndarray] | None = None,
+) -> Tuple[
+    Dict[int, float],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    Dict[int, pd.DatetimeIndex],
+]:
+    """
+    Generic expanding-window univariate OOS driver with arbitrary prediction_length.
+
+    forecast_multi_step_fn(y_hist, origin_date, prediction_length) -> array of shape (H,)
+
+    Returns dicts keyed by horizon h = 1..H:
+      - r2[h]       : scalar R²_OS for horizon h
+      - trues[h]    : np.array of true values at horizon h
+      - preds[h]    : np.array of predictions at horizon h
+      - dates[h]    : DatetimeIndex of evaluation dates for horizon h
+    """
+    if forecast_multi_step_fn is None:
+        raise ValueError("forecast_multi_step_fn must be provided.")
+    if prediction_length <= 0:
+        raise ValueError("prediction_length must be >= 1")
+
+    y = y.astype("float32").dropna()
+    if y.empty:
+        raise ValueError("Target series is empty after cleaning.")
+
+    # enforce min history before first origin
+    start_ts = expand_start_with_min_history(
+        y.index, start_oos, min_history_months=min_history_months
+    )
+
+    # also need enough future data to evaluate all horizons
+    last_valid_origin = y.index[-prediction_length]  # index for t such that t+H-1 exists
+    test_idx = y.index[(y.index >= start_ts) & (y.index <= last_valid_origin)]
+
+    if not quiet:
+        print(f"[{model_name}] prediction_length={prediction_length}, "
+              f"origins={len(test_idx)}, first_origin={test_idx[0].date()}, "
+              f"last_origin={test_idx[-1].date()}")
+
+    preds = {h: [] for h in range(1, prediction_length+1)}
+    trues = {h: [] for h in range(1, prediction_length+1)}
+    dates = {h: [] for h in range(1, prediction_length+1)}
+
+    for date_t in test_idx:
+        pos = y.index.get_loc(date_t)
+        if isinstance(pos, slice):
+            pos = pos.start
+
+        y_hist = y.iloc[:pos]
+        if y_hist.isna().any():
+            continue
+
+        y_hat_vec = forecast_multi_step_fn(y_hist, date_t, prediction_length)
+        y_hat_vec = np.asarray(y_hat_vec, float).reshape(-1)
+        if len(y_hat_vec) < prediction_length:
+            continue
+
+        for h in range(1, prediction_length + 1):
+            target_pos = pos + (h - 1)
+            y_true = float(y.iloc[target_pos])
+            y_hat = float(y_hat_vec[h-1])
+            if np.isnan(y_true) or np.isnan(y_hat):
+                continue
+            if ct_cutoff:
+                y_hat = float(ct_truncate(y_hat))
+            trues[h].append(y_true)
+            preds[h].append(y_hat)
+            dates[h].append(y.index[target_pos])
+
+    # convert to arrays/index & compute R² per horizon
+    r2 = {}
+    for h in range(1, prediction_length+1):
+        trues[h] = np.asarray(trues[h], float)
+        preds[h] = np.asarray(preds[h], float)
+        dates[h] = pd.DatetimeIndex(dates[h])
+
+        if len(trues[h]) == 0:
+            r2[h] = np.nan
+            if not quiet:
+                print(f"[{model_name}] horizon h={h}: no valid predictions.")
+        else:
+            r2[h] = evaluate_oos(
+                trues[h],
+                preds[h],
+                model_name=f"{model_name} (h={h})",
+                device="cpu",
+                quiet=quiet,
+            )
+
+    return r2, trues, preds, dates
+
+
+# ================================================================
+# 3. OLS & RANKING (1-step tabular)
+# ================================================================
+
+def make_lagged_features(df: pd.DataFrame, vars_, lag: int) -> pd.DataFrame:
+    df = df.copy()
     for L in range(1, lag + 1):
-        for v in variables:
+        for v in vars_:
             df[f"{v}_lag{L}"] = df[v].shift(L)
+    return df
 
-    feature_cols = [f"{v}_lag1" for v in variables] if lag == 1 \
-                   else [f"{v}_lag{L}" for v in variables for L in range(1, lag+1)]
 
-    start_oos = pd.Timestamp(start_oos)
-    predictions, actuals, dates = [], [], []
+def ols_oos(
+    data: pd.DataFrame,
+    variables=("d/p",),
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    start_date="1927-01-01",
+    lag=1,
+    min_train=30,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str | None = None,
+):
+    """
+    Expanding-window OLS with lagged predictors (1-step ahead).
+    """
+    if model_name is None:
+        model_name = f"OLS({','.join(variables)})"
 
-    for date_t in df.index:
-        if date_t < start_oos:
-            continue
+    df = ensure_datetime_index(data)
+    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+    df = make_lagged_features(df, variables, lag)
 
-        # estimation window: up to but excluding date_t
-        est = df.loc[:date_t].iloc[:-1]
+    feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag+1)]
 
-        # drop NaNs exactly like before
-        est = est.dropna(subset=feature_cols + ['equity_premium'])
-        if len(est) < 30:
-            continue
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        est = est.dropna(subset=feature_cols + [target_col])
+        if len(est) < min_train:
+            return None
 
-        X_train = est[feature_cols].to_numpy()
-        y_train = est['equity_premium'].to_numpy()
+        X_train = est[feature_cols].to_numpy(float)
+        y_train = est[target_col].to_numpy(float)
 
-        # one-step-ahead features
-        x_pred = df.loc[date_t, feature_cols].to_numpy(dtype=float).reshape(1, -1)
-        if np.isnan(x_pred).any():
-            continue
+        if row_t[feature_cols].isna().any():
+            return None
+        x_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
 
         model = LinearRegression().fit(X_train, y_train)
-        pred = float(model.predict(x_pred)[0])
-        pred = max(pred, 0.0)  # keep your truncation, if you want it (or remove)
+        return float(model.predict(x_pred)[0])
 
-        y_t = float(df.loc[date_t, 'equity_premium'])
-
-        predictions.append(pred)
-        actuals.append(y_t)
-        dates.append(date_t)
-
-    r2 = evaluate_oos(actuals, predictions,
-                      model_name=f"OLS({','.join(variables)})",
-                      device=device, quiet=quiet)
-
-    # return the traces for plotting
-    return r2, np.asarray(actuals, float), np.asarray(predictions, float), pd.DatetimeIndex(dates)
-
-
-
-# --- Driver to evaluate many monthly variables with your function ---
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        min_history_months=None,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        model_fit_predict_fn=fit_predict,
+    )
 
 
 def rank_monthly_predictors(
-    data,
+    data: pd.DataFrame,
     monthly_vars,
     start_date="1927-01-01",
     start_oos="1965-01-01",
     lag=1,
     quiet=True,
+    ct_cutoff=True,
 ):
     """
-    Calls your linear_regression_oos once per variable, collects OOS R²,
-    and prints a worst->best ranking. Returns a DataFrame with results.
+    1-step OLS predictor ranking (unchanged logic).
     """
     results = []
     for v in monthly_vars:
         try:
-            r2,_,_,_ = linear_regression_oos(
+            r2, _, _, _ = ols_oos(
                 data,
-                variables=[v],
+                variables=(v,),
+                target_col="equity_premium",
                 start_oos=start_oos,
-                device="cpu",
-                quiet=quiet,   # suppress per-variable prints
-                lag=lag,
                 start_date=start_date,
+                lag=lag,
+                min_train=30,
+                ct_cutoff=ct_cutoff,
+                quiet=True,
+                model_name=f"OLS({v})",
             )
         except Exception as e:
-            # capture failures as NaN with an error message
             r2 = float("nan")
-            print(f"[WARN] {v}: {e}")
-
+            if not quiet:
+                print(f"[WARN] {v}: {e}")
         results.append({"variable": v, "r2_oos": r2})
 
     res_df = pd.DataFrame(results)
-
-    # For sorting: treat NaN as -inf (worst)
     sort_key = res_df["r2_oos"].fillna(-inf)
     res_df = res_df.loc[sort_key.sort_values(ascending=True).index].reset_index(drop=True)
 
-    # Pretty print worst -> best
     print("\nMonthly predictors ranked (worst → best) by OOS R²:")
     for i, row in res_df.iterrows():
         r2 = row["r2_oos"]
@@ -211,168 +429,33 @@ def rank_monthly_predictors(
     return res_df
 
 
-
-
-
-
-
-def chronos_oos(
-    data,
-    start_oos="1965-01-01",
-    quiet=False,
-    ct_cutoff=True,          # Campbell–Thompson cutoff at 0
-):
-    # ---------- data ----------
-    df = data.sort_index()[["equity_premium"]].dropna().asfreq("MS")
-    y = df["equity_premium"].astype("float32")
-    start_oos = pd.Timestamp(start_oos)
-    test_idx = y.index[y.index >= start_oos]
-
-    if not quiet:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[Chronos] data {df.index[0].date()}→{df.index[-1].date()}  n={len(df)}  device={dev}")
-
-    # ---------- model ----------
-    pipe = BaseChronosPipeline.from_pretrained(
-        "amazon/chronos-bolt-small",
-        device_map="cuda" if torch.cuda.is_available() else "cpu",
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    )
-
-    # ---------- expanding OOS ----------
-    preds, trues, dates = [], [], []
-    for date_t in test_idx:
-        pos = y.index.get_loc(date_t)
-        if pos < 24:       # need some history
-            continue
-
-        ctx = y.iloc[:pos].to_numpy(dtype="float32")
-        if np.isnan(ctx).any() or len(ctx) == 0:
-            continue
-
-        with torch.inference_mode():
-            _, mean_pred = pipe.predict_quantiles(
-                context=[torch.tensor(ctx)],
-                prediction_length=1,
-                quantile_levels=[0.5],
-            )
-
-        y_hat = float(mean_pred[0, 0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
-
-        y_true = float(y.iloc[pos])
-        if np.isnan(y_hat) or np.isnan(y_true):
-            continue
-
-        preds.append(y_hat)
-        trues.append(y_true)
-        dates.append(date_t)
-
-    if len(preds) == 0:
-        raise RuntimeError("No valid Chronos predictions. Ensure enough pre-1965 history.")
-
-    # ---------- evaluate & return traces for plotting ----------
-    r2 = evaluate_oos(trues, preds, model_name="Chronos-Bolt", device=("cuda" if torch.cuda.is_available() else "cpu"), quiet=quiet)
-    return r2, np.asarray(trues, float), np.asarray(preds, float), pd.DatetimeIndex(dates)
-
-
-def timesfm_oos(
-    data,
-    start_oos="1965-01-01",
-    min_context=120,          # require at least 10 years of history
-    max_context=512,         # TimesFM context length
-    ct_cutoff=True,           # Campbell–Thompson cutoff at 0
-    quiet=False,
-):
-    """
-    Expanding-window one-step-ahead OOS using Google TimesFM (PyTorch port).
-    Returns: (r2, y_true, y_pred, dates) for plotting.
-    """
-
-    # 1) Device note (TimesFM torch port takes NumPy; runs on CPU unless tensors are moved)
-    torch.set_float32_matmul_precision("high")
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    if not quiet:
-        print(f"[TimesFM] Using device hint: {device}")
-
-    # 2) Data prep
-    df = data.sort_index()[["equity_premium"]].dropna().asfreq("MS")
-    y = df["equity_premium"].astype("float32")
-    if len(y) == 0:
-        raise ValueError("No equity_premium data after cleaning.")
-
-    # 3) Load TimesFM model
-    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
-    cfg = timesfm.ForecastConfig(
-        max_context=max_context,
-        max_horizon=128,
-        normalize_inputs=True,
-        use_continuous_quantile_head=True,
-        force_flip_invariance=True,
-        infer_is_positive=False,
-        fix_quantile_crossing=True,
-    )
-    model.compile(cfg)
-
-    # 4) Expanding OOS loop
-    start_oos = pd.Timestamp(start_oos)
-    test_idx = y.index[y.index >= start_oos]
-    preds, trues, oos_dates = [], [], []
-
-    for date_t in test_idx:
-        pos = y.index.get_loc(date_t)
-        if pos < min_context:
-            print("skipping")
-            continue
-
-        context = y.iloc[:pos].to_numpy(dtype="float32")
-        if len(context) > cfg.max_context:
-            context = context[-cfg.max_context:]
-        if np.isnan(context).any() or np.std(context) < 1e-6:
-            continue
-
-        with torch.inference_mode():
-            point_fcst, _ = model.forecast(horizon=1, inputs=[context])
-
-        y_hat = float(point_fcst[0, 0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
-
-        y_true = float(y.iloc[pos])
-        if np.isnan(y_hat) or np.isnan(y_true):
-            continue
-
-        preds.append(y_hat)
-        trues.append(y_true)
-        oos_dates.append(date_t)
-
-    if len(preds) == 0:
-        raise RuntimeError("No valid TimesFM predictions were generated. Check min_context/start_oos/data length.")
-
-    r2 = evaluate_oos(trues, preds, model_name="TimesFM", device=device, quiet=quiet)
-    return r2, np.asarray(trues, float), np.asarray(preds, float), pd.DatetimeIndex(oos_dates)
-
+# ================================================================
+# 4. TREE ENSEMBLE (XGB / GBRT, 1-step)
+# ================================================================
 
 def tree_ensemble_oos(
-    data,
+    data: pd.DataFrame,
     variables,
+    target_col="equity_premium",
     start_oos="1965-01-01",
     start_date="1927-01-01",
     lag=1,
     min_train=120,
     ct_cutoff=True,
+    drop_sparse=True,
+    sparse_thresh=0.6,
     quiet=False,
     model_params=None,
-    drop_sparse=True,          # drop too-sparse features per window
-    sparse_thresh=0.6,         # require >=60% non-missing in the training window
 ):
+    """
+    1-step tree ensemble OOS (same logic as before).
+    """
     import numpy as np
-    import pandas as pd
 
-    # pick model
     if model_params is None:
         model_params = {}
+
+    # model selection
     try:
         from xgboost import XGBRegressor
         use_xgb = True
@@ -382,7 +465,9 @@ def tree_ensemble_oos(
             objective="reg:squarederror", random_state=42,
         )
         default_params.update(model_params)
-        def Model(): return XGBRegressor(**default_params)
+
+        def make_model():
+            return XGBRegressor(**default_params)
     except Exception:
         from sklearn.ensemble import GradientBoostingRegressor
         use_xgb = False
@@ -391,299 +476,183 @@ def tree_ensemble_oos(
             subsample=0.8, random_state=42,
         )
         default_params.update(model_params)
-        def Model(): return GradientBoostingRegressor(**default_params)
 
-    # data prep
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
+        def make_model():
+            return GradientBoostingRegressor(**default_params)
+
+    df = ensure_datetime_index(data)
     df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
-    if "equity_premium" not in df.columns:
-        raise ValueError("data must contain 'equity_premium' column.")
 
     # lag features
-    for L in range(1, lag + 1):
-        for v in variables:
-            df[f"{v}_lag{L}"] = df[v].shift(L)
-    feature_cols_all = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
-    start_oos = pd.Timestamp(start_oos)
+    df = make_lagged_features(df, variables, lag)
 
-    preds, trues, oos_dates = [], [], []
-    loop_dates = df.index[df.index >= start_oos]
 
-    for date_t in loop_dates:
-        pos = df.index.get_loc(date_t)
-        est = df.iloc[:pos].copy()  # strictly past
+    all_feats = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
 
-        # choose candidate features (optionally drop very sparse in the training window)
-        feats = feature_cols_all
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        feats = all_feats
+
         if drop_sparse:
             avail = est[feats].notna().mean(axis=0)
             feats = [c for c in feats if avail.get(c, 0.0) >= sparse_thresh]
-            if len(feats) == 0:
-                continue
+            if not feats:
+                return None
 
-        # need at least min_train rows of y, regardless of NaNs in X
-        y_est = est["equity_premium"]
+        y_est = est[target_col]
         if y_est.notna().sum() < min_train:
-            continue
+            return None
 
-        # compute training-window medians for features (past-only)
         med = est[feats].median(skipna=True)
 
-        # impute features in training window with medians (no look-ahead)
         X_train = est[feats].fillna(med).to_numpy()
         y_train = y_est.to_numpy()
-
-        # drop rows where y is NaN (X already imputed)
         m = ~np.isnan(y_train)
         X_train, y_train = X_train[m], y_train[m]
         if len(y_train) < min_train:
-            continue
+            return None
 
-        # prepare x_pred: past-only ffill then fallback to training median
-        x_pred_series = df.loc[date_t, feats].copy()
-        past_vals = est[feats].iloc[-1:].ffill().iloc[0]      # ffill from past
-        x_pred_series = x_pred_series.fillna(past_vals)
-        x_pred_series = x_pred_series.fillna(med)              # fallback to training medians
-        x_pred = x_pred_series.to_numpy(dtype=float).reshape(1, -1)
+        past_vals = est[feats].iloc[-1:].ffill().iloc[0]
+        x_pred_series = row_t[feats].fillna(past_vals).fillna(med)
+        x_pred = x_pred_series.to_numpy(float).reshape(1, -1)
         if np.isnan(x_pred).any():
-            continue
+            return None
 
-        # fit & predict
-        model = Model()
+        model = make_model()
         model.fit(X_train, y_train)
-        y_hat = float(model.predict(x_pred)[0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
-
-        y_true = float(df.loc[date_t, "equity_premium"])
-        if np.isnan(y_true):
-            continue
-
-        preds.append(y_hat)
-        trues.append(y_true)
-        oos_dates.append(date_t)
-
-    if len(preds) == 0:
-        raise RuntimeError("No valid predictions; loosen sparsity threshold, reduce vars, or lower min_train.")
+        return float(model.predict(x_pred)[0])
 
     name = "XGB" if use_xgb else "GBRT"
-    r2 = evaluate_oos(trues, preds, model_name=f"{name}({','.join(variables)})", device="cpu", quiet=quiet)
-    return r2, np.asarray(trues, float), np.asarray(preds, float), pd.DatetimeIndex(oos_dates)
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=all_feats,
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        min_history_months=None,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=f"{name}({','.join(variables)})",
+        model_fit_predict_fn=fit_predict,
+    )
 
 
+# ================================================================
+# 5. DEEP TS MODELS – CHRONOS, TIMESFM, FLOWSTATE, MOIRAI2
+# ================================================================
 
+# 5.1 Chronos
+from chronos import BaseChronosPipeline
 
-
-def moirai2_retrain_each_step(
+def chronos_oos(
     data: pd.DataFrame,
-    covariates=("d/p", "tms", "dfy"),
+    target_col="equity_premium",
     start_oos="1965-01-01",
-    ctx=240,
-    device="cpu",
-    ct_cutoff=False,
-    quiet=False,
-    model_name="Moirai 2 (reinstantiated each step)",
-    FREQ_STR="M",  # month-end; avoids pandas <MonthBegin> issue in GluonTS 0.14.x
-):
-    """
-    Expanding-window, one-step-ahead forecasting with Moirai-2.
-    Returns: (r2_oos, y_true, y_pred, dates) for plotting.
-    """
-    if not quiet:
-        print(f"[moirai2] Using freq='{FREQ_STR}' (month-end) | ctx={ctx}")
-
-    # --- Data prep: coerce index to month-end ---
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df.index = df.index.to_period(FREQ_STR).to_timestamp(FREQ_STR)
-    df = df.sort_index().asfreq(FREQ_STR)
-
-    needed = ["equity_premium"] + list(covariates)
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
-    df = df[needed].dropna()
-    y = df["equity_premium"].astype("float32")
-    covs = [df[c].astype("float32") for c in covariates]
-
-    start_oos = pd.Timestamp(start_oos).to_period(FREQ_STR).to_timestamp(FREQ_STR)
-    test_idx = y.index[y.index >= start_oos]
-
-    preds, trues, oos_dates = [], [], []
-
-    # Reuse module across steps
-    module = Moirai2Module.from_pretrained("Salesforce/moirai-2.0-R-small")
-
-    # --- Helper: dataset up to (t-1) ---
-    def make_entry(end_ts: pd.Timestamp):
-        pos = y.index.get_loc(end_ts)
-        if isinstance(pos, slice):
-            pos = pos.start
-        if pos <= 0:
-            return None
-
-        y_hist = y.values[:pos]
-        if y_hist.size == 0:
-            return None
-
-        # keep last ctx points
-        if len(y_hist) > ctx:
-            y_hist = y_hist[-ctx:]
-            start_idx = pos - len(y_hist)
-        else:
-            start_idx = 0
-
-        entry = {
-            "start": pd.Timestamp(y.index[start_idx]),
-            "target": y_hist.astype("float32"),
-        }
-
-        if len(covs) > 0:
-            mats = [c.values[:pos] for c in covs]
-            mats = [m[-len(y_hist):] for m in mats]  # align to target len
-            entry["past_feat_dynamic_real"] = np.vstack(mats).astype("float32")  # (num_feat, T)
-
-        return ListDataset([entry], freq=FREQ_STR)
-
-    # --- Monthly loop (re-instantiate forecaster each step) ---
-    for date_t in test_idx:
-        pos = y.index.get_loc(date_t)
-        if pos < 60:   # require at least some warmup history
-            continue
-
-        ds_one = make_entry(date_t)
-        if ds_one is None:
-            continue
-
-        model = Moirai2Forecast(
-            module=module,
-            prediction_length=1,
-            context_length=ctx,
-            target_dim=1,
-            feat_dynamic_real_dim=0,
-            past_feat_dynamic_real_dim=len(covs),
-        )
-        predictor = model.create_predictor(batch_size=2)
-        try:
-            predictor = predictor.to(device)
-        except Exception:
-            pass
-
-        f = next(predictor.predict(ds_one))
-        y_hat = float(f.quantile(0.5)[0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
-
-        y_true = float(y.iloc[pos])
-        if not (np.isnan(y_hat) or np.isnan(y_true)):
-            preds.append(y_hat)
-            trues.append(y_true)
-            oos_dates.append(date_t)
-
-    # --- Evaluate & return traces for plotting ---
-    trues = np.asarray(trues, dtype=float)
-    preds = np.asarray(preds, dtype=float)
-    if preds.size == 0:
-        raise RuntimeError("No valid Moirai-2 predictions; check data coverage / ctx / start_oos.")
-    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
-    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
-
-
-
-
-
-
-def ols_oos_dp_lag(
-    data: pd.DataFrame,
-    start_oos="1965-01-01",
-    lag=1,
-    min_train=30,
+    freq="MS",
+    prediction_length: int = 1,
+    ct_cutoff=True,
     quiet=False,
 ):
-    df = data.copy()
+    df = ensure_datetime_index(data)
+    y = align_monthly(df[[target_col]], freq, col=target_col)[target_col]
 
-    # 1) Ensure datetime index & sort
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = BaseChronosPipeline.from_pretrained(
+        "amazon/chronos-bolt-small",
+        device_map=device,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+    )
 
-    # 2) Ensure equity_premium exists
-    if "equity_premium" not in df.columns:
-        raise ValueError("Column 'equity_premium' not found in data.")
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+        ctx = y_hist.to_numpy(dtype="float32")
+        if len(ctx) < 24:
+            return np.full(H, np.nan, dtype="float32")
+        with torch.inference_mode():
+            _, mean_pred = pipe.predict_quantiles(
+                context=[torch.tensor(ctx, device=device)],
+                prediction_length=H,
+                quantile_levels=[0.5],
+            )
+        # mean_pred shape: (batch, H)
+        return np.asarray(mean_pred[0, :H], dtype="float32")
 
-    # 3) Create dp_lag if missing (try 'd/p' or 'dp' as source)
-    if "dp_lag" not in df.columns:
-        src = None
-        if "d/p" in df.columns:
-            src = "d/p"
-        elif "dp" in df.columns:
-            src = "dp"
-        else:
-            raise ValueError("Neither 'dp_lag' nor a source column ('d/p' or 'dp') exists.")
-        df["dp_lag"] = df[src].shift(lag)
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=240,   # 20 years
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name="Chronos-Bolt",
+        forecast_multi_step_fn=forecast_multi_step,
+    )
+    return r2, trues, preds, dates
 
-    start_oos = pd.Timestamp(start_oos)
 
-    predictions, actuals = [], []
+# 5.2 TimesFM
+import timesfm
 
-    # 4) Expanding-window OOS loop
-    for date_t in df.index:
-        if date_t < start_oos:
-            continue
-
-        # strictly past data up to t-1
-        est = df.loc[:date_t].iloc[:-1].copy()
-
-        # drop rows with NaNs in training features or target
-        est = est.dropna(subset=["dp_lag", "equity_premium"])
-        if len(est) < min_train:
-            continue
-
-        X_train = est[["dp_lag"]].to_numpy(dtype=float)
-        y_train = est["equity_premium"].to_numpy(dtype=float)
-
-        # feature for prediction at time t
-        x_pred = df.loc[date_t, "dp_lag"]
-        if pd.isna(x_pred):
-            continue
-        X_pred = np.array([[float(x_pred)]])
-
-        # fit OLS and predict
-        model = LinearRegression().fit(X_train, y_train)
-        pred = float(model.predict(X_pred)[0])
-
-        predictions.append(pred)
-        actuals.append(float(df.loc[date_t, "equity_premium"]))
-
-    # 5) To arrays
-    predictions = np.asarray(predictions, dtype=float)
-    actuals = np.asarray(actuals, dtype=float)
-
-    if predictions.size == 0:
-        raise RuntimeError("No valid predictions produced. Check lags/data coverage.")
-
-    # 6) Metrics
-    mse = mean_squared_error(actuals, predictions)
-    rmse = float(np.sqrt(mse))
-    mean_forecast = np.array([actuals[:i].mean() for i in range(1, len(actuals) + 1)])
-    denom = np.sum((actuals - mean_forecast) ** 2)
-    r2_oos = float(1 - np.sum((actuals - predictions) ** 2) / denom) if denom > 0 else np.nan
-
+def timesfm_oos(
+    data: pd.DataFrame,
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    freq="MS",
+    prediction_length: int = 1,
+    min_context=120,
+    max_context=512,
+    ct_cutoff=True,
+    quiet=False,
+):
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     if not quiet:
-        print(f"[OLS Benchmark] Valid months={len(actuals)} | "
-              f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
+        print(f"[TimesFM] Using device hint: {device}")
 
-    return r2_oos, mse, rmse, actuals, predictions
+    df = ensure_datetime_index(data)
+    y = align_monthly(df[[target_col]], freq, col=target_col)[target_col].astype("float32")
+    if len(y) == 0:
+        raise ValueError("No target data after cleaning.")
+
+    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
+    cfg = timesfm.ForecastConfig(
+        max_context=max_context,
+        max_horizon=max(prediction_length, 128),
+        normalize_inputs=True,
+        use_continuous_quantile_head=True,
+        force_flip_invariance=True,
+        infer_is_positive=False,
+        fix_quantile_crossing=True,
+    )
+    model.compile(cfg)
+
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+        context = y_hist.to_numpy(dtype="float32")
+        if len(context) < min_context:
+            return np.full(H, np.nan, dtype="float32")
+        if len(context) > cfg.max_context:
+            context = context[-cfg.max_context:]
+        if np.isnan(context).any() or np.std(context) < 1e-6:
+            return np.full(H, np.nan, dtype="float32")
+
+        with torch.inference_mode():
+            point_fcst, _ = model.forecast(horizon=H, inputs=[context])
+        # shape: (1, H)
+        return np.asarray(point_fcst[0, :H], dtype="float32")
+
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=0,  # rely on min_context
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name="TimesFM",
+        forecast_multi_step_fn=forecast_multi_step,
+    )
+    return r2, trues, preds, dates
 
 
-import numpy as np
-import pandas as pd
-import torch
+# 5.3 FlowState
 from tsfm_public import FlowStateForPrediction
 
 def flowstate_oos(
@@ -692,25 +661,17 @@ def flowstate_oos(
     start_oos="1965-01-01",
     ctx=240,
     freq="M",
+    prediction_length: int = 1,
     scale_factor=0.25,
     quantile=0.5,
     ct_cutoff=False,
     quiet=False,
-    model_name="FlowState (expanding, 1-step)",
-    auto_move_start=True,
+    model_name="FlowState (expanding)",
 ):
-    # -------------------- data prep --------------------
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-
-    if target_col not in df.columns:
-        raise ValueError(f"'{target_col}' not found.")
-
+    df = ensure_datetime_index(data)
     s = df[[target_col]].copy()
 
-    def align_monthly(series, f):
+    def align_freq(series, f):
         z = series.copy()
         z.index = z.index.to_period(f).to_timestamp(f)
         z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(f)
@@ -718,10 +679,10 @@ def flowstate_oos(
         return z
 
     if freq in {"M", "MS"}:
-        s = align_monthly(s, freq)
+        s = align_freq(s, freq)
         if s[target_col].isna().all():
             alt = "M" if freq == "MS" else "MS"
-            s = align_monthly(df[[target_col]], alt)
+            s = align_freq(df[[target_col]], alt)
             if not quiet:
                 print(f"[FlowState] Retried with freq='{alt}' because '{freq}' produced all-NaN.")
             freq = alt
@@ -733,127 +694,176 @@ def flowstate_oos(
     if y.isna().all():
         raise ValueError("Target is all NaN after preprocessing/alignment.")
 
-    start_oos = pd.Timestamp(start_oos)
-    if freq in {"M", "MS"}:
-        start_oos = start_oos.to_period(freq).to_timestamp(freq)
-
-    if start_oos < y.index.min():
-        start_oos = y.index.min()
-
-    pos0 = y.index.get_indexer([start_oos], method="backfill")[0]
-    while pos0 < ctx and auto_move_start and pos0 < len(y):
-        pos0 += 1
-    if pos0 >= len(y):
-        raise ValueError("No valid start date with sufficient history found.")
-    start_oos = y.index[pos0]
-    test_idx = y.index[y.index >= start_oos]
-
-    if not quiet:
-        print(f"[FlowState] freq={freq} | rows={len(y)} | first={y.index.min().date()} | last={y.index.max().date()}")
-        print(f"[FlowState] start_oos={start_oos.date()} | ctx={ctx} | tests={len(test_idx)}")
-
-    # -------------------- model --------------------
-    # Avoid MPS due to incompatibility; prefer CUDA else CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     predictor = FlowStateForPrediction.from_pretrained("ibm-research/flowstate").to(device)
 
-    preds, trues = [], []
-    oos_dates = []   # <--- add this
+    q_idx = {"value": None}
 
-    q_idx = None
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+        if len(y_hist) < ctx:
+            return np.full(H, np.nan, dtype="float32")
 
-    # -------------------- expanding OOS loop --------------------
-    for date_t in test_idx:
+        ctx_vals = y_hist.iloc[-ctx:].to_numpy(dtype="float32")
+        if np.isnan(ctx_vals).any():
+            return np.full(H, np.nan, dtype="float32")
+
+        ctx_tensor = torch.from_numpy(ctx_vals[:, None, None]).to(torch.float32).to(device)
+        with torch.inference_mode():
+            out = predictor(ctx_tensor, scale_factor=scale_factor, prediction_length=H, batch_first=False)
+        po = out.prediction_outputs  # expected shape: (1, num_quantiles, H, 1)
+
+        if q_idx["value"] is None:
+            if hasattr(out, "quantile_values"):
+                qs = torch.tensor(out.quantile_values, device=po.device)
+                q_idx["value"] = int(torch.argmin(torch.abs(qs - quantile)).item())
+            else:
+                q_idx["value"] = po.shape[1] // 2
+
+        # (H,) vector
+        vec = po[0, q_idx["value"], :H, 0].detach().cpu().numpy().astype("float32")
+        return vec
+
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=0,  # rely on ctx
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        forecast_multi_step_fn=forecast_multi_step,
+    )
+    return r2, trues, preds, dates
+
+
+# 5.4 Moirai2
+from gluonts.dataset.common import ListDataset
+from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
+
+def moirai2_oos(
+    data: pd.DataFrame,
+    covariates=("d/p", "tms", "dfy"),
+    start_oos="1965-01-01",
+    ctx=240,
+    prediction_length: int = 1,
+    device="cpu",
+    ct_cutoff=False,
+    quiet=False,
+    model_name="Moirai 2 (reinstantiated each step)",
+    FREQ_STR="M",
+):
+    if not quiet:
+        print(f"[Moirai2] Using freq='{FREQ_STR}' (month-end) | ctx={ctx} | H={prediction_length}")
+
+    df = ensure_datetime_index(data)
+    df.index = df.index.to_period(FREQ_STR).to_timestamp(FREQ_STR)
+    df = df.sort_index().asfreq(FREQ_STR)
+
+    needed = ["equity_premium"] + list(covariates)
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    df = df[needed].dropna()
+    y = df["equity_premium"].astype("float32")
+    cov_df = df[list(covariates)].astype("float32")
+
+    module = Moirai2Module.from_pretrained("Salesforce/moirai-2.0-R-small")
+
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
         pos = y.index.get_loc(date_t)
         if isinstance(pos, slice):
             pos = pos.start
-        if pos < ctx:
-            continue
+        if pos <= 0 or pos < 60:
+            return np.full(H, np.nan, dtype="float32")
 
-        ctx_vals = y.values[pos - ctx: pos]
-        if np.isnan(ctx_vals).any():
-            continue
+        y_hist_full = y.values[:pos]
+        if len(y_hist_full) == 0:
+            return np.full(H, np.nan, dtype="float32")
 
-        # ensure float32 and correct device
-        ctx_tensor = torch.from_numpy(ctx_vals[:, None, None]).to(torch.float32).to(device)  # (ctx, 1, 1)
+        if len(y_hist_full) > ctx:
+            y_seg = y_hist_full[-ctx:]
+            start_idx = pos - len(y_seg)
+        else:
+            y_seg = y_hist_full
+            start_idx = 0
 
-        with torch.inference_mode():
-            out = predictor(ctx_tensor, scale_factor=scale_factor, prediction_length=1, batch_first=False)
-        po = out.prediction_outputs  # (1, num_quantiles, 1, 1)
+        entry = {
+            "start": pd.Timestamp(y.index[start_idx]),
+            "target": y_seg.astype("float32"),
+        }
 
-        if q_idx is None:
-            if hasattr(out, "quantile_values"):
-                qs = torch.tensor(out.quantile_values, device=po.device)
-                q_idx = int(torch.argmin(torch.abs(qs - quantile)).item())
-            else:
-                q_idx = po.shape[1] // 2
+        if len(covariates) > 0:
+            mats = [cov_df[c].values[:pos] for c in covariates]
+            mats = [m[-len(y_seg):] for m in mats]
+            entry["past_feat_dynamic_real"] = np.vstack(mats).astype("float32")
 
-        y_hat = float(po[0, q_idx, 0, 0].detach().cpu().numpy())
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
+        ds_one = ListDataset([entry], freq=FREQ_STR)
 
-        y_true = float(y.iloc[pos])
-        if np.isnan(y_hat) or np.isnan(y_true):
-            continue
+        model = Moirai2Forecast(
+            module=module,
+            prediction_length=H,
+            context_length=ctx,
+            target_dim=1,
+            feat_dynamic_real_dim=0,
+            past_feat_dynamic_real_dim=len(covariates),
+        )
+        predictor = model.create_predictor(batch_size=2)
+        try:
+            predictor = predictor.to(device)
+        except Exception:
+            pass
 
-        preds.append(y_hat)
-        trues.append(y_true)
-        oos_dates.append(date_t)   # <--- add this
+        f = next(predictor.predict(ds_one))
+        q_med = f.quantile(0.5)  # shape: (H,)
+        vec = np.asarray(q_med[:H], dtype="float32")
+        return vec
+
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=0,  # rely on pos>=60 + ctx
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        forecast_multi_step_fn=forecast_multi_step,
+    )
+    return r2, trues, preds, dates
 
 
-    trues = np.asarray(trues, dtype=float)
-    preds = np.asarray(preds, dtype=float)
+# ================================================================
+# 6. TABPFN (tabular, 1-step) & TABPFN-TS (multi-step)
+# ================================================================
 
-    if preds.size == 0:
-        raise RuntimeError("No valid FlowState predictions. Check ctx/start_oos/freq alignment.")
-
-    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
-    return r2, trues, preds,pd.DatetimeIndex(oos_dates)
 def tabpfn_oos_fit_each_step(
     data: pd.DataFrame,
-    variables=("d/p", "tms", "dfy"),   # predictors to use
+    variables=("d/p", "tms", "dfy"),
     target_col="equity_premium",
     start_oos="1965-01-01",
     start_date="1927-01-01",
-    lag=1,                             # create v_lag1..v_lag{lag}
-    min_train=120,                     # require at least N training rows
-    ct_cutoff=False,                   # Campbell–Thompson clamp at 0
+    lag=1,
+    min_train=120,
+    ct_cutoff=False,
     quiet=False,
     model_name="TabPFN (fit each step)",
-    model_params=None,                 # e.g. {"N_ensemble_configurations":8}
+    model_params=None,
 ):
     """
-    Expanding-window OOS with TabPFNRegressor, re-fitting at every step.
-
-    Steps per month t >= start_oos:
-      - Training window = all rows up to t-1 (strictly past)
-      - Drop NaNs in features/target
-      - Fit TabPFNRegressor on (X_train, y_train)
-      - Predict y_hat at time t using lagged features
-    Returns: (r2, y_true, y_pred, dates)
+    Tabular TabPFN: still 1-step (needs exogenous predictors).
     """
-    import numpy as np
-    import pandas as pd
     import torch
     try:
         from tabpfn import TabPFNRegressor
     except Exception as e:
-        raise RuntimeError(
-            "TabPFN not installed. Please `pip install tabpfn`."
-        ) from e
+        raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
 
     if model_params is None:
         model_params = {}
-    # sensible defaults
     default_params = dict(N_ensemble_configurations=8)
     default_params.update(model_params)
 
-    # ---------- data prep ----------
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
+    df = ensure_datetime_index(data)
     df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
     if target_col not in df.columns:
@@ -862,120 +872,90 @@ def tabpfn_oos_fit_each_step(
         if v not in df.columns:
             raise ValueError(f"Predictor '{v}' not found in data.")
 
-    # create lag features 1..lag
     for L in range(1, lag + 1):
         for v in variables:
             df[f"{v}_lag{L}"] = df[v].shift(L)
-
-    # feature list
     feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
 
-    start_oos = pd.Timestamp(start_oos)
-    loop_dates = df.index[df.index >= start_oos]
-
-    preds, trues, oos_dates = [], [], []
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    for date_t in loop_dates:
-        pos = df.index.get_loc(date_t)
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        from tabpfn import TabPFNRegressor
 
-        # strictly past data up to t-1
-        est = df.iloc[:pos].copy()
+        est_clean = est.dropna(subset=feature_cols + [target_col])
+        if len(est_clean) < min_train:
+            return None
 
-        # drop rows with any NaNs in features or target
-        est = est.dropna(subset=feature_cols + [target_col])
-        if len(est) < min_train:
-            continue
+        X_train = est_clean[feature_cols].to_numpy(float)
+        y_train = est_clean[target_col].to_numpy(float)
 
-        X_train = est[feature_cols].to_numpy(dtype=float)
-        y_train = est[target_col].to_numpy(dtype=float)
+        if row_t[feature_cols].isna().any():
+            return None
+        X_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
 
-        # features for prediction at t
-        if df.loc[date_t, feature_cols].isna().any():
-            continue
-        X_pred = df.loc[date_t, feature_cols].to_numpy(dtype=float).reshape(1, -1)
-        y_true = float(df.loc[date_t, target_col])
-
-        # fit TabPFN *this step*
         model = TabPFNRegressor(device=device, **default_params)
         model.fit(X_train, y_train)
+        return float(model.predict(X_pred)[0])
 
-        # predict
-        y_hat = float(model.predict(X_pred)[0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
-
-        preds.append(y_hat)
-        trues.append(y_true)
-        oos_dates.append(date_t)
-
-    if not preds:
-        raise RuntimeError("No valid TabPFN predictions. Check lags/min_train/start_oos/data coverage.")
-
-    trues = np.asarray(trues, float)
-    preds = np.asarray(preds, float)
-    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
-    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        min_history_months=None,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        model_fit_predict_fn=fit_predict,
+    )
 
 
 def tabpfn_ts_oos_fit_each_step(
     data: pd.DataFrame,
     target_col: str = "equity_premium",
     start_oos: str = "1965-01-01",
-    ctx: int = 240,                 # context length (months)
-    freq: str = "M",                # "M" or "MS"
-    min_windows: int = 120,         # require at least this many training windows before 1st OOS
-    ct_cutoff: bool = False,        # Campbell–Thompson clamp at 0
+    ctx: int = 240,
+    freq: str = "M",
+    prediction_length: int = 1,
+    min_windows: int = 120,
+    ct_cutoff: bool = False,
     quiet: bool = False,
     model_name: str = "TabPFN-TS (fit each step)",
-    forecaster_repo: str = "tabpfn/tabpfn-ts",  # HF repo or local model id
-    fit_kwargs: dict | None = None,             # e.g., {"epochs": 1}
+    forecaster_repo: str = "tabpfn/tabpfn-ts",
+    fit_kwargs: dict | None = None,
 ):
     """
-    Expanding-window, one-step-ahead OOS using TabPFN-TS, *retraining at every step*.
+    Expanding-window, multi-step OOS using TabPFN-TS, retrained at each origin.
 
-    For each OOS date t:
-      - Build training windows from the past (length=ctx), targets are next step.
-      - Instantiate a fresh TabPFN-TS forecaster.
-      - If `.fit` exists: fit on (contexts, targets), then predict at t.
-        Else: zero-shot predict from pretrained checkpoint.
-    Returns: (r2, y_true, y_pred, dates)
+    Uses recursive predictions for horizons > 1.
     """
-    import numpy as np
-    import pandas as pd
     import torch
-
-    # -------- imports / model handle --------
     try:
         from tabpfn_ts import TabPFNForecaster
     except Exception as e:
-        raise RuntimeError(
-            "tabpfn-ts not found. Install it first (e.g., `pip install tabpfn-ts`)."
-        ) from e
+        raise RuntimeError("tabpfn-ts not found. Install it first (`pip install tabpfn-ts`).") from e
 
     if fit_kwargs is None:
-        fit_kwargs = {}  # lightweight defaults
+        fit_kwargs = {}
 
-    # -------- data prep (monthly align like FlowState) --------
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
+    df = ensure_datetime_index(data)
 
     if target_col not in df.columns:
         raise ValueError(f"'{target_col}' not found.")
 
-    def align_monthly(series: pd.DataFrame, f: str) -> pd.DataFrame:
+    def align_freq(series: pd.DataFrame, f: str) -> pd.DataFrame:
         z = series.copy()
         z.index = z.index.to_period(f).to_timestamp(f)
         z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(f)
         z[target_col] = z[target_col].ffill()
         return z
 
-    s = align_monthly(df[[target_col]], freq if freq in {"M", "MS"} else "M")
+    s = align_freq(df[[target_col]], freq if freq in {"M", "MS"} else "M")
     if s[target_col].isna().all() and freq in {"M", "MS"}:
         alt = "M" if freq == "MS" else "MS"
-        s = align_monthly(df[[target_col]], alt)
+        s = align_freq(df[[target_col]], alt)
         if not quiet:
             print(f"[TabPFN-TS] Retried with freq='{alt}' because '{freq}' produced all-NaN.")
         freq = alt
@@ -984,26 +964,11 @@ def tabpfn_ts_oos_fit_each_step(
     if y.isna().all():
         raise ValueError("Target is all NaN after preprocessing/alignment.")
 
-    # snap OOS start to grid
-    start_oos = pd.Timestamp(start_oos)
-    if freq in {"M", "MS"}:
-        start_oos = start_oos.to_period(freq).to_timestamp(freq)
-
-    # ensure first OOS date exists on index
-    if start_oos < y.index.min():
-        start_oos = y.index.min()
-
-    test_idx = y.index[y.index >= start_oos]
-
     if not quiet:
         print(f"[TabPFN-TS] freq={freq} | rows={len(y)} | first={y.index.min().date()} | last={y.index.max().date()}")
-        print(f"[TabPFN-TS] start_oos={start_oos.date()} | ctx={ctx} | min_windows={min_windows} | tests={len(test_idx)}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    preds, trues, oos_dates = [], [], []
-
-    # -------- helper to build sliding windows --------
     def build_windows(arr: np.ndarray, end_pos: int, w: int):
         """
         Build contexts (N, w, 1) and targets (N,) from arr[:end_pos].
@@ -1012,90 +977,82 @@ def tabpfn_ts_oos_fit_each_step(
         N = end_pos - w
         if N <= 0:
             return None, None
-        X = np.lib.stride_tricks.sliding_window_view(arr[:end_pos], window_shape=w, axis=0)  # (N, w)
+        X = np.lib.stride_tricks.sliding_window_view(arr[:end_pos], window_shape=w, axis=0)
         X = X.astype("float32")[..., None]  # (N, w, 1)
         y_next = arr[w:end_pos].astype("float32")  # length N
         return X, y_next
 
-    # -------- expanding loop --------
-    for date_t in test_idx:
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
         pos = y.index.get_loc(date_t)
         if isinstance(pos, slice):
             pos = pos.start
 
-        # need at least ctx for context + some windows to train
         if pos < ctx + min_windows:
-            continue
+            return np.full(H, np.nan, dtype="float32")
 
-        # training windows from strictly past
         contexts, targets = build_windows(y.values, end_pos=pos, w=ctx)
         if contexts is None or len(contexts) < min_windows:
-            continue
+            return np.full(H, np.nan, dtype="float32")
         if np.isnan(contexts).any() or np.isnan(targets).any():
-            continue
+            return np.full(H, np.nan, dtype="float32")
 
-        # last context (predict at t)
-        ctx_last = y.values[pos - ctx: pos].astype("float32")[None, :, None]  # (1, ctx, 1)
-        if np.isnan(ctx_last).any():
-            continue
+        # we will recursively forecast using a copy of y_hist
+        history = y_hist.copy()
 
-        # fresh forecaster this step
-        # try pretrained init; if your build prefers a plain constructor, swap this line:
-        #   model = TabPFNForecaster()
         try:
             model = TabPFNForecaster.from_pretrained(forecaster_repo).to(device)
         except Exception:
             model = TabPFNForecaster().to(device)
-
         model.eval()
 
-        # If the forecaster exposes .fit, fine-tune on sliding windows
-        did_fit = False
         if hasattr(model, "fit"):
             try:
-                # fit expects (contexts, targets); adapt if your build needs a dict/dataloader
                 model.fit(
-                    contexts=contexts,   # (N, ctx, 1)
-                    targets=targets,     # (N,)
-                    **fit_kwargs
+                    contexts=contexts,
+                    targets=targets,
+                    **fit_kwargs,
                 )
-                did_fit = True
             except Exception as e:
                 if not quiet:
                     print(f"[TabPFN-TS] fit failed at {date_t.date()}: {e}")
+                return np.full(H, np.nan, dtype="float32")
 
-        # Predict next step
-        with torch.inference_mode():
-            # Some builds accept numpy; others want tensors
-            try:
-                out = model.predict(ctx_last)  # (1, 1)
-            except Exception:
-                ctx_tensor = torch.tensor(ctx_last, dtype=torch.float32, device=device)
-                out = model.predict(ctx_tensor)  # (1, 1)
-                if isinstance(out, torch.Tensor):
-                    out = out.detach().cpu().numpy()
+        preds = []
+        for h in range(H):
+            # last ctx window from current history
+            if len(history) < ctx:
+                return np.full(H, np.nan, dtype="float32")
+            ctx_vals = history.iloc[-ctx:].to_numpy(dtype="float32")
+            if np.isnan(ctx_vals).any():
+                return np.full(H, np.nan, dtype="float32")
 
-        y_hat = float(np.asarray(out).reshape(-1)[0])
-        if ct_cutoff:
-            y_hat = max(y_hat, 0.0)
+            ctx_last = ctx_vals[None, :, None]  # (1, ctx, 1)
+            with torch.inference_mode():
+                try:
+                    out = model.predict(ctx_last)  # (1, 1)
+                except Exception:
+                    ctx_tensor = torch.tensor(ctx_last, dtype=torch.float32, device=device)
+                    out = model.predict(ctx_tensor)
+                    if isinstance(out, torch.Tensor):
+                        out = out.detach().cpu().numpy()
 
-        y_true = float(y.iloc[pos])
-        if np.isnan(y_true) or np.isnan(y_hat):
-            continue
+            y_hat = float(np.asarray(out).reshape(-1)[0])
+            preds.append(y_hat)
+            # append prediction to history for next step
+            history = pd.concat(
+                [history, pd.Series([y_hat], index=[history.index[-1] + (history.index[1] - history.index[0])])]
+            )
 
-        preds.append(y_hat)
-        trues.append(y_true)
-        oos_dates.append(date_t)
+        return np.asarray(preds, dtype="float32")
 
-        if not quiet and (len(oos_dates) % 60 == 0):
-            print(f"[TabPFN-TS] progress: {len(oos_dates)} OOS preds...")
-
-    if not preds:
-        raise RuntimeError("No valid TabPFN-TS predictions; check ctx/min_windows/start_oos or package API.")
-
-    trues = np.asarray(trues, float)
-    preds = np.asarray(preds, float)
-    r2 = evaluate_oos(trues, preds, model_name=model_name, device=device, quiet=quiet)
-    return r2, trues, preds, pd.DatetimeIndex(oos_dates)
-
-    #missing: CT truncation, 20 years after the series begins (≥1946), they recompute any filter/coefficients expanding in time.
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=0,  # rely on ctx + min_windows
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        forecast_multi_step_fn=forecast_multi_step,
+    )
+    return r2, trues, preds, dates
