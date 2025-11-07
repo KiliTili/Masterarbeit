@@ -247,6 +247,7 @@ def expanding_oos_tabular(
     preds, trues, oos_dates = [], [], []
 
     for date_t in loop_dates:
+        print(date_t)
         pos = df.index.get_loc(date_t)
         est = df.iloc[:pos].copy()        # strictly past
         row_t = df.iloc[pos]
@@ -925,7 +926,7 @@ def tabpfn_oos_fit_each_step(
     quiet=False,
     model_name="TabPFN (fit each step)",
     model_params=None,
-    mode = "mean",
+    mode="mean",
 ):
     """
     Tabular TabPFN: still 1-step (needs exogenous predictors).
@@ -933,14 +934,13 @@ def tabpfn_oos_fit_each_step(
     import torch
     try:
         from tabpfn import TabPFNRegressor
+        from tabpfn.constants import ModelVersion
     except Exception as e:
         raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
 
-    if model_params is None:
-        model_params = {}
-    default_params = dict(N_ensemble_configurations=8)
-    default_params.update(model_params)
-
+    # ---- FIX: don't use N_ensemble_configurations here ----
+    default_params: dict = {}
+    
     df = ensure_datetime_index(data)
     df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
@@ -971,7 +971,11 @@ def tabpfn_oos_fit_each_step(
             return None
         X_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
 
-        model = TabPFNRegressor(device=device, **default_params)
+        # only pass parameters that TabPFNRegressor actually supports
+        if model_params == '2.5':
+            model = TabPFNRegressor(device=device)
+        else:
+            model = TabPFNRegressor.create_default_for_version(ModelVersion.V2,device=device)
         model.fit(X_train, y_train)
         return float(model.predict(X_pred)[0])
 
@@ -987,8 +991,9 @@ def tabpfn_oos_fit_each_step(
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
-        mode = mode, 
+        mode=mode,
     )
+
 
 
 def tabpfn_ts_oos_fit_each_step(
