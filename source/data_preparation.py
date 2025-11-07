@@ -25,12 +25,12 @@ def calc_equity_premium(df, uselog = True):
     return df
 
 def drop_na_after_1926(df):
-    """Drop rows with NA equity premium from 1926-01-01 onward (keep earlier rows)."""
     df = df.copy()
     start = pd.Timestamp('1926-01-01')
-    idx = df.index  # DatetimeIndex
-    mask = ((idx <= start) | df['equity_premium'].notna()) & (idx >= start)
-    return df.loc[mask]
+    idx = df.index
+    before = idx < start
+    after  = (idx >= start) & df['equity_premium'].notna()
+    return df.loc[before | after]
 
 def prepare_data(file_path="../../Data/GoyalAndWelch.xlsx"):
     """Load and prepare the data."""

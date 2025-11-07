@@ -14,8 +14,69 @@ import torch
 # ================================================================
 # 1. COMMON UTILITIES
 # ================================================================
+def plot_oos_multi(models, ylabel="Equity premium"):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for name, (r2, y_true, y_pred, dates) in models.items():
+        ax.plot(dates, y_pred, label=f"{name} (R²={r2:.3f})")
+    # plot true values from the first
+    first_dates = list(models.values())[0][3]
+    first_true = list(models.values())[0][1]
+    ax.plot(first_dates, first_true, color="black", linewidth=1.5, label="True")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylabel(ylabel)
+    ax.legend()
+    plt.show()
 
-def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False):
+def baseline_forecast(
+    y_true: np.ndarray,
+    mode: str = "mean",
+) -> np.ndarray:
+    """
+    Build a baseline forecast sequence for y_true.
+
+    Parameters
+    ----------
+    y_true : 1D array of OOS realizations (after masking NaNs)
+    mode   : "mean" | "rw" | "rw_drift"
+
+    Returns
+    -------
+    baseline : 1D array, same length as y_true
+               (may contain NaN in the first element for RW-type baselines)
+    """
+    y_true = np.asarray(y_true, float)
+
+    if mode == "mean":
+        # expanding mean: same as your original evaluate_oos
+        return np.array([y_true[:i].mean() for i in range(1, len(y_true)+1)])
+
+    elif mode == "rw":
+        # https://agorism.dev/book/finance/time-series/James%20Douglas%20Hamilton%20-%20Time%20Series%20Analysis%20%281994%2C%20Princeton%20University%20Press%29%20-%20libgen.lc.pdf
+        # random walk: forecast y_t by y_{t-1}
+        b = np.empty_like(y_true)
+        b[:] = np.nan
+        b[0] = y_true[0]
+        if len(y_true) > 1:
+            b[1:] = y_true[:-1]
+        return b
+
+    elif mode == "rw_drift":
+        # random walk with expanding drift in the OOS sample:
+        # y_t^RW = y_{t-1} + μ_{t-1}, where μ_{t-1} is mean of Δy up to t-1
+        b = np.empty_like(y_true)
+        b[:] = np.nan
+        if len(y_true) > 1:
+            # differences Δy_t = y_t - y_{t-1}
+            diffs = np.diff(y_true)
+            # expanding mean of diffs
+            drift = np.array([diffs[:i].mean() for i in range(1, len(diffs)+1)])
+            # baseline from t=1 onward: y_{t-1} + μ_{t-1}
+            b[1:] = y_true[:-1] + drift
+        return b
+
+    else:
+        raise ValueError(f"Unknown baseline mode: {mode}")
+def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, mode: str = "mean",):
     """
     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
     using the expanding mean as the benchmark forecast.
@@ -34,7 +95,7 @@ def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False):
     mse = mean_squared_error(y_true, y_pred)
     rmse = float(np.sqrt(mse))
 
-    mean_forecast = np.array([y_true[:i].mean() for i in range(1, len(y_true)+1)])
+    mean_forecast = baseline_forecast(y_true, mode=mode)
     denom = np.sum((y_true - mean_forecast) ** 2)
     r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom) if denom > 0 else np.nan
 
@@ -53,6 +114,7 @@ def plot_oos(
     ylabel="Equity premium",
     save_path=None,
     show=True,
+    mode = 'mean'
 ):
     """
     Plot true values, model predictions, and expanding-mean benchmark.
@@ -63,9 +125,9 @@ def plot_oos(
     m = ~np.isnan(y_true) & ~np.isnan(y_pred)
     y_true, y_pred = y_true[m], y_pred[m]
 
-    csum = np.cumsum(y_true)
-    mean_forecast = csum / np.arange(1, len(y_true) + 1)
-
+    #csum = np.cumsum(y_true)
+    #mean_forecast = csum / np.arange(1, len(y_true) + 1)
+    mean_forecast = baseline_forecast(y_true,mode)
     if dates is not None:
         x = pd.to_datetime(pd.Index(dates))[m]
     else:
@@ -156,6 +218,7 @@ def expanding_oos_tabular(
     quiet: bool = False,
     model_name: str = "Model",
     model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
+    mode = "mean"
 ) -> Tuple[float, np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """
     Generic expanding-window OOS driver for tabular models (1-step ahead).
@@ -211,7 +274,7 @@ def expanding_oos_tabular(
 
     trues = np.asarray(trues, float)
     preds = np.asarray(preds, float)
-    r2 = evaluate_oos(trues, preds, model_name=model_name, device="cpu", quiet=quiet)
+    r2 = evaluate_oos(trues, preds, model_name=model_name, device="cpu", quiet=quiet, mode = mode)
     return r2, trues, preds, pd.DatetimeIndex(oos_dates)
 
 
@@ -224,6 +287,7 @@ def expanding_oos_univariate(
     quiet: bool = False,
     model_name: str = "TS-Model",
     forecast_multi_step_fn: Callable[[pd.Series, pd.Timestamp, int], np.ndarray] | None = None,
+    mode = "mean",
 ) -> Tuple[
     Dict[int, float],
     Dict[int, np.ndarray],
@@ -312,6 +376,7 @@ def expanding_oos_univariate(
                 model_name=f"{model_name} (h={h})",
                 device="cpu",
                 quiet=quiet,
+                mode = mode
             )
 
     return r2, trues, preds, dates
@@ -340,6 +405,7 @@ def ols_oos(
     ct_cutoff: bool = False,
     quiet: bool = False,
     model_name: str | None = None,
+    mode = "mean"
 ):
     """
     Expanding-window OLS with lagged predictors (1-step ahead).
@@ -380,6 +446,7 @@ def ols_oos(
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
+        mode = mode
     )
 
 
@@ -446,6 +513,7 @@ def tree_ensemble_oos(
     sparse_thresh=0.6,
     quiet=False,
     model_params=None,
+    mode = "mean"
 ):
     """
     1-step tree ensemble OOS (same logic as before).
@@ -534,6 +602,7 @@ def tree_ensemble_oos(
         quiet=quiet,
         model_name=f"{name}({','.join(variables)})",
         model_fit_predict_fn=fit_predict,
+        mode = mode
     )
 
 
@@ -552,6 +621,7 @@ def chronos_oos(
     prediction_length: int = 1,
     ct_cutoff=True,
     quiet=False,
+    mode = "mean"
 ):
     df = ensure_datetime_index(data)
     y = align_monthly(df[[target_col]], freq, col=target_col)[target_col]
@@ -585,6 +655,7 @@ def chronos_oos(
         quiet=quiet,
         model_name="Chronos-Bolt",
         forecast_multi_step_fn=forecast_multi_step,
+        mode = mode
     )
     return r2, trues, preds, dates
 
@@ -602,6 +673,7 @@ def timesfm_oos(
     max_context=512,
     ct_cutoff=True,
     quiet=False,
+    mode = "mean"
 ):
     torch.set_float32_matmul_precision("high")
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -648,6 +720,7 @@ def timesfm_oos(
         quiet=quiet,
         model_name="TimesFM",
         forecast_multi_step_fn=forecast_multi_step,
+        mode = mode
     )
     return r2, trues, preds, dates
 
@@ -667,6 +740,7 @@ def flowstate_oos(
     ct_cutoff=False,
     quiet=False,
     model_name="FlowState (expanding)",
+    mode = "mean"
 ):
     df = ensure_datetime_index(data)
     s = df[[target_col]].copy()
@@ -732,6 +806,7 @@ def flowstate_oos(
         quiet=quiet,
         model_name=model_name,
         forecast_multi_step_fn=forecast_multi_step,
+        mode = mode
     )
     return r2, trues, preds, dates
 
@@ -751,6 +826,7 @@ def moirai2_oos(
     quiet=False,
     model_name="Moirai 2 (reinstantiated each step)",
     FREQ_STR="M",
+    mode = "mean"
 ):
     if not quiet:
         print(f"[Moirai2] Using freq='{FREQ_STR}' (month-end) | ctx={ctx} | H={prediction_length}")
@@ -828,6 +904,7 @@ def moirai2_oos(
         quiet=quiet,
         model_name=model_name,
         forecast_multi_step_fn=forecast_multi_step,
+        mode = mode
     )
     return r2, trues, preds, dates
 
@@ -848,6 +925,7 @@ def tabpfn_oos_fit_each_step(
     quiet=False,
     model_name="TabPFN (fit each step)",
     model_params=None,
+    mode = "mean",
 ):
     """
     Tabular TabPFN: still 1-step (needs exogenous predictors).
@@ -909,6 +987,7 @@ def tabpfn_oos_fit_each_step(
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
+        mode = mode, 
     )
 
 
@@ -925,6 +1004,7 @@ def tabpfn_ts_oos_fit_each_step(
     model_name: str = "TabPFN-TS (fit each step)",
     forecaster_repo: str = "tabpfn/tabpfn-ts",
     fit_kwargs: dict | None = None,
+    mode = "mean"
 ):
     """
     Expanding-window, multi-step OOS using TabPFN-TS, retrained at each origin.
@@ -1054,5 +1134,6 @@ def tabpfn_ts_oos_fit_each_step(
         quiet=quiet,
         model_name=model_name,
         forecast_multi_step_fn=forecast_multi_step,
+        mode = mode
     )
     return r2, trues, preds, dates
