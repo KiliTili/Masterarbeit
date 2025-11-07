@@ -1,0 +1,15 @@
+,Ticker,Description
+0,M1WO,MSCI World Index: Measures the performance of large and mid-cap stocks across 23 Developed Markets (DM) countries.
+1,NKY,Nikkei 225 Stock Average (Japan): A price-weighted stock index of 225 large companies on the Tokyo Stock Exchange.
+2,SXXT,"STOXX Europe 600 Total Market Index (Total Return): Broad pan-European index covering large, mid, and small market capitalisation companies."
+3,SPTR,"S&P 500 Total Return Index: A market-cap weighted index of 500 leading US publicly traded companies, including reinvested dividends."
+4,GC1,Gold Futures (Generic 1st contract): The ticker for the front-month Gold futures contract on exchanges like COMEX/NYMEX.
+5,CL1,WTI Crude Oil Futures (Generic 1st contract): The ticker for the front-month West Texas Intermediate (WTI) crude oil futures contract on NYMEX.
+6,EUR003M,3-Month EURIBOR: The benchmark interest rate indicating the average rate at which major banks in the Eurozone lend unsecured funds to one another.
+7,FEDL01,Effective Federal Funds Rate (EFFR) / US Treasury Rate 3M: Represents the effective target rate for overnight US interbank borrowing (or related short-term US Treasury rates).
+8,USYC2Y10,US Treasury Yield Spread (10-Year minus 2-Year): The difference between the 10-year and 2-year US Treasury Constant Maturity yields.
+9,MOVE,Merrill Lynch Option Volatility Estimate (MOVE) Index: A measure of implied volatility of the US Treasury market (bond market).
+10,VIX,Cboe Volatility Index: The premier measure of the stock market’s expectation of 30-day volatility based on S&P 500 (SPX) index options.
+11,V2X,"VSTOXX Index: A measure of expected volatility in the European stock market, based on EURO STOXX 50 index options."
+12,VXJ,"Nikkei Volatility Index (Implied Volatility Nikkei): A measure of expected volatility in the Japanese stock market, based on Nikkei 225 options."
+13,SPX,S&P 500 Price Index: The primary market-cap weighted index of 500 leading US publicly traded companies (excludes dividends).
