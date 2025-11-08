@@ -10,7 +10,7 @@ from sklearn.linear_model import LinearRegression
 import os, sys
 sys.path.insert(0, os.path.abspath('../'))
 
-from source.modelling import evaluate_oos,ensure_datetime_index,align_monthly, expand_start_with_min_history
+from source.modelling_utils import evaluate_oos,ensure_datetime_index,align_monthly, expand_start_with_min_history
 import torch
 def expanding_oos_univariate_multistep(
     y: pd.Series,

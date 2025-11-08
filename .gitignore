@@ -1,1 +1,12 @@
-.pyc
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS-specific
+.DS_Store
