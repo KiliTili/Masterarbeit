@@ -94,7 +94,6 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import roc_curve
 
-from momentfm import MOMENTPipeline
 
 import numpy as np
 import pandas as pd
@@ -103,7 +102,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import roc_curve
 
-from momentfm import MOMENTPipeline
+
 
 
 def moment_cls_oos(
@@ -180,7 +179,12 @@ def moment_cls_oos(
     """
     # --------------------
     # 0. Device
-    # --------------------
+    # --------------------#
+    try:
+        from momentfm import MOMENTPipeline
+    except Exception as e:
+            raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
+
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -430,7 +434,7 @@ def make_tabpfn_lag_cls_fit_predict_fn(
     base_cols = list(base_cols)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+    def fit_predict(est: pd.DataFrame):
         # need enough history to build lags
         if len(est) <= n_lags:
             return np.nan
