@@ -27,18 +27,18 @@ def make_logit_multifeature_lag_fit_predict_fn(
     Training uses only past data.
     """
 
-    def fit_predict(est: pd.DataFrame):
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
         # Need enough history to build lags
         if len(est) <= n_lags:
             return np.nan
 
-        tmp = est[base_cols + [target_col]].copy()
+        df_all = pd.concat([est, row_t.to_frame().T])
+        tmp = df_all[base_cols + [target_col]].copy()
 
         # --- build lag features for each base_col ---
         for col in base_cols:
             for k in range(1, n_lags + 1):
                 tmp[f"{col}_lag{k}"] = tmp[col].shift(k)
-
         # collect all lag feature names
         lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
 

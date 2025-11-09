@@ -539,7 +539,7 @@ def expanding_oos_tabular_cls(
         if pd.isna(y_true):
             continue
 
-        y_hat = model_fit_predict_fn(est)
+        y_hat = model_fit_predict_fn(est, row_t)
         if y_hat is None or (isinstance(y_hat, float) and np.isnan(y_hat)):
             continue
 
