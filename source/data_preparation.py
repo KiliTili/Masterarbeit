@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+from hmmlearn.hmm import GaussianHMM
+import matplotlib.pyplot as plt
 
 
 def load_data(file_path="../../Data/GoyalAndWelch.xlsx"):
@@ -39,3 +41,87 @@ def prepare_data(file_path="../../Data/GoyalAndWelch.xlsx"):
     df = calc_equity_premium(df)
     df = drop_na_after_1926(df)
     return df
+
+
+#### Classification specific functions #### 
+
+def difference_over_variables(df,variables_dif = ('EUR003M',
+       'FEDL01')  ,variables_log_dif = ('M1WO', 'NKY', 'SXXT','SPX','NKY','SPTR','GC1','CL1'), variables_log = ('V2X', 'MOVE', 'VIX', 'USYC2Y10', 'VXJ') ):
+    for var in variables_log_dif:
+        df = convert_stationary_variables_with_log(df, var)
+    for var in variables_dif:
+        df = convert_stationary_variables(df, var)
+    for var in variables_log:
+        df[var] = df[var].apply(lambda x: np.log(x) if x > 0 else 0)
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+
+def convert_stationary_variables(df, var):  
+    df[var] = df[var].diff()
+    #df = df.dropna().reset_index(drop=True)
+    return df
+def convert_stationary_variables_with_log(df, var):  
+    df[var] = df[var].apply(lambda x: np.log(x) if x > 0 else 0)
+    df[var] = df[var].diff()
+    #df = df.dropna().reset_index(drop=True)
+    return df
+
+
+def label_states(df_diff, variable='M1WO', n_states=2):
+    returns = df_diff[variable].dropna().values.reshape(-1, 1)
+
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=1000, random_state = 42) #full does not matter
+    model.fit(returns)
+
+    trans_mat = model.transmat_
+    print("Transition matrix (rows sum to 1):")
+    print(trans_mat)
+    hidden_states = model.predict(returns)
+    r = returns.reshape(-1)
+    state_means = np.array([r[hidden_states == i].mean() for i in range(model.n_components)])
+    state_stds  = np.array([r[hidden_states == i].std()  for i in range(model.n_components)])
+
+    print("State means:", state_means)
+    print("State stds: ", state_stds)
+
+    eps = 1e-8  # avoid divide-by-zero
+    scores = state_means / (state_stds + eps)
+
+    bull_state = np.argmax(scores)
+    bear_state = np.argmin(scores)
+
+    print(f"Bull state: {bull_state}, Bear state: {bear_state}")
+
+    df_states = df_diff.loc[df_diff[variable].notna()].copy()
+    df_states['state'] = hidden_states
+    df_states['regime'] = df_states['state'].map({bull_state: 'Bull', bear_state: 'Bear'})
+
+    plt.figure(figsize=(12,6))
+    plt.plot(df_states['timestamp'], df_states[variable], label='M1WO Returns', color='black')
+
+    plt.fill_between(
+        df_states['timestamp'], df_states[variable].min(), df_states[variable].max(),
+        where=df_states['regime'] == 'Bear', color='red', alpha=0.25, label='Bear Regime'
+    )
+    plt.fill_between(
+        df_states['timestamp'], df_states[variable].min(), df_states[variable].max(),
+        where=df_states['regime'] == 'Bull', color='green', alpha=0.15, label='Bull Regime'
+    )
+
+    plt.title('M1WO: Bull & Bear Market Regimes (HMM)')
+    plt.xlabel('Timestamp')
+    plt.ylabel('M1WO Returns')
+    plt.legend()
+    plt.show()
+
+    return df_states
+
+
+def create_classification_data(file_path="../../Data/GoyalAndWelch.xlsx"):
+    df = pd.read_csv("../../Data/MSCI_World_Data.csv")
+    df_diff = difference_over_variables(df)
+    df_diff['timestamp'] = pd.to_datetime(df_diff['timestamp'])
+
+    df_states = label_states(df_diff)
+    return df_states

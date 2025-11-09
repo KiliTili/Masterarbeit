@@ -9,6 +9,10 @@ from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import LinearRegression
 
 import torch
+from collections import Counter
+import numpy as np
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
+
 
 
 def plot_oos_multi(models, ylabel="Equity premium"):
@@ -73,6 +77,51 @@ def baseline_forecast(
 
     else:
         raise ValueError(f"Unknown baseline mode: {mode}")
+    
+
+
+from collections import Counter
+import numpy as np
+
+def baseline_classification(y_true, mode: str = "majority"):
+    """
+    Time-series-safe baselines for classification.
+
+    Parameters
+    ----------
+    y_true : 1D array-like of OOS labels in chronological order
+    mode   : "majority" | "persistence"
+
+    Returns
+    -------
+    baseline : 1D array of baseline predictions, same length as y_true
+    """
+
+    y_true = np.asarray(y_true)
+    n = len(y_true)
+    baseline = np.empty_like(y_true, dtype=y_true.dtype)
+
+    if mode == "majority":
+        # expanding majority using ONLY past labels:
+        # for t=0 we can't compute a past majority, so just use y_true[0]
+        for i in range(n):
+            if i == 0:
+                baseline[i] = y_true[0]
+            else:
+                counts = Counter(y_true[:i])   # past only, y_true[0..i-1]
+                baseline[i] = counts.most_common(1)[0][0]
+        return baseline
+
+    elif mode == "persistence":
+        # persistence: y_hat_t = y_{t-1}, with y_hat_0 = y_true[0] by convention
+        baseline[0] = y_true[0]
+        if n > 1:
+            baseline[1:] = y_true[:-1]
+        return baseline
+
+    else:
+        raise ValueError(f"Unknown baseline mode: {mode}")
+
 def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, mode: str = "mean",):
     """
     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
@@ -101,6 +150,68 @@ def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, 
               f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
 
     return r2_oos
+def evaluate_oos_classification(
+    y_true,
+    y_pred,
+    model_name: str = "Model",
+    baseline_mode: str = "majority",
+    quiet: bool = False,
+):
+    """
+    OOS evaluation for Bull/Bear classification.
+
+    Parameters
+    ----------
+    y_true        : 1D array of true labels (e.g. 0/1 or "Bear"/"Bull")
+    y_pred        : 1D array of model predictions (same type as y_true)
+    baseline_mode : "majority" or "persistence"
+    """
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    # mask NaNs (works if labels are numeric or you used np.nan for missing)
+    mask = ~np.isnan(y_true) if np.issubdtype(y_true.dtype, np.number) else np.ones_like(y_true, bool)
+    y_true, y_pred = y_true[mask], y_pred[mask]
+
+    if len(y_true) == 0:
+        if not quiet:
+            print(f"[{model_name}] No valid predictions (all NaN).")
+        return {
+            "acc": np.nan,
+            "bal_acc": np.nan,
+            "acc_baseline": np.nan,
+            "bal_acc_baseline": np.nan,
+            "skill_acc": np.nan,
+        }
+
+    # model performance
+    acc = accuracy_score(y_true, y_pred)
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+
+    # baseline performance
+    y_base = baseline_classification(y_true, mode=baseline_mode)
+    acc_base = accuracy_score(y_true, y_base)
+    bal_acc_base = balanced_accuracy_score(y_true, y_base)
+
+    # skill score (analogue of R² relative to baseline accuracy)
+    skill_acc = (acc - acc_base) / (1 - acc_base) if acc_base < 1.0 else np.nan
+
+    if not quiet:
+        print(
+            f"[{model_name}] Valid obs={len(y_true)} | "
+            f"Acc={acc:.4f} (baseline={acc_base:.4f}) | "
+            f"BalAcc={bal_acc:.4f} (baseline={bal_acc_base:.4f}) | "
+            f"Skill_Acc={skill_acc:.4f}"
+        )
+
+    return {
+        "acc": acc,
+        "bal_acc": bal_acc,
+        "acc_baseline": acc_base,
+        "bal_acc_baseline": bal_acc_base,
+        "skill_acc": skill_acc,
+    }
 
 
 def plot_oos(
@@ -379,3 +490,76 @@ def expanding_oos_univariate(
     return r2, trues, preds, dates
 
 
+def expanding_oos_tabular_cls(
+    data: pd.DataFrame,
+    target_col: str = "state",
+    start_oos: str = "2007-01-01",
+    start_date: str = "2000-01-05",
+    min_train: int = 120,
+    min_history_months: int | None = None,
+    quiet: bool = False,
+    model_name: str = "Logit-lag-baseline",
+    model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
+    baseline_mode: str = "majority",   # for evaluate_oos_classification
+):
+    """
+    Expanding-window 1-step-ahead OOS driver for CLASSIFICATION.
+    Returns: (metrics_dict, y_true, y_pred, oos_dates)
+    """
+    
+    if model_fit_predict_fn is None:
+        raise ValueError("You must supply model_fit_predict_fn.")
+    data.index = pd.to_datetime(data.timestamp, format = "%Y-%m-%d")
+    df = data.copy()
+    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+
+    if target_col not in df.columns:
+        raise ValueError(f"'{target_col}' not found in data.")
+
+    if min_history_months is not None:
+        start_ts = expand_start_with_min_history(df.index, start_oos, min_history_months)
+    else:
+        start_ts = pd.Timestamp(start_oos)
+
+    loop_dates = df.index[df.index >= start_ts]
+
+    preds, trues, oos_dates = [], [], []
+
+    for date_t in loop_dates:
+        print( date_t)
+        pos = df.index.get_loc(date_t)
+        est = df.iloc[:pos].copy()      # strictly past
+        row_t = df.iloc[pos]
+
+        # require enough past non-missing target for a meaningful model
+        if est[target_col].notna().sum() < min_train:
+            continue
+
+        y_true = row_t[target_col]
+        if pd.isna(y_true):
+            continue
+
+        y_hat = model_fit_predict_fn(est)
+        if y_hat is None or (isinstance(y_hat, float) and np.isnan(y_hat)):
+            continue
+
+        trues.append(int(y_true))
+        preds.append(int(y_hat))
+        oos_dates.append(date_t)
+
+    if not preds:
+        raise RuntimeError(f"[{model_name}] No valid predictions produced.")
+
+    trues = np.asarray(trues, int)
+    preds = np.asarray(preds, int)
+    oos_dates = pd.DatetimeIndex(oos_dates)
+
+    metrics = evaluate_oos_classification(
+        trues,
+        preds,
+        model_name=model_name,
+        baseline_mode=baseline_mode,
+        quiet=quiet,
+    )
+
+    return metrics, trues, preds, oos_dates
