@@ -28,60 +28,42 @@ def make_logit_multifeature_lag_fit_predict_fn(
     """
 
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        # Need enough history to build lags
         if len(est) <= n_lags:
             return np.nan
 
-        df_all = pd.concat([est, row_t.to_frame().T])
-        tmp = df_all[base_cols + [target_col]].copy()
-
-        # --- build lag features for each base_col ---
+        # ---- TRAINING DATA: build lags on est ONLY (strictly past) ----
+        tmp = est[base_cols + [target_col]].copy()
         for col in base_cols:
             for k in range(1, n_lags + 1):
                 tmp[f"{col}_lag{k}"] = tmp[col].shift(k)
-        # collect all lag feature names
+
         lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
-
-        # Drop rows with missing values (any lag or target)
         tmp = tmp.dropna(subset=[target_col] + lag_cols)
-        if tmp.empty:
+        if tmp.empty or tmp[target_col].nunique() < 2:
             return np.nan
 
-        X_train = tmp[lag_cols].values
-        y_train = tmp[target_col].astype(int).values
+        X_train = tmp[lag_cols].to_numpy()
+        y_train = tmp[target_col].astype(int).to_numpy()
 
-        # Need both classes to fit logistic regression
-        if np.unique(y_train).size < 2:
-            return np.nan
-
-        # Fit logistic regression
         clf = LogisticRegression(
-            C=C,
-            class_weight=class_weight,
-            max_iter=max_iter,
-            solver="lbfgs",
+            C=C, class_weight=class_weight, max_iter=max_iter, solver="lbfgs"
         )
         clf.fit(X_train, y_train)
 
-        # --- construct lagged features for the current date ---
-        if len(est) < n_lags:
-            return np.nan
-
+        # ---- PREDICTION FEATURES at date t: lags from est ----
         lag_values = []
         for col in base_cols:
-            vals = est[col].iloc[-n_lags:]  # last n values
+            vals = est[col].iloc[-n_lags:]   # t-1,...,t-n
             if vals.isna().any():
                 return np.nan
             lag_values.extend(vals.values)
-        x_t = np.array(lag_values).reshape(1, -1)
 
-        # --- prediction ---
+        x_t = np.array(lag_values, dtype=float).reshape(1, -1)
+
         if return_proba:
-            p1 = clf.predict_proba(x_t)[0, 1]
-            return float(p1)
+            return float(clf.predict_proba(x_t)[0, 1])
         else:
-            y_hat = clf.predict(x_t)[0]
-            return int(y_hat)
+            return int(clf.predict(x_t)[0])
 
     return fit_predict
 
@@ -429,50 +411,46 @@ def make_tabpfn_lag_cls_fit_predict_fn(
         if len(est) <= n_lags:
             return np.nan
 
-        df_all = pd.concat([est, row_t.to_frame().T])
-        tmp = df_all[base_cols + [target_col]].copy()
-
-        # --- build lag features for each base_col ---
+        # ---------- TRAIN ON PAST ONLY ----------
+        # Build lag features on 'est' (strictly past)
+        tmp = est[list(base_cols) + [target_col]].copy()
         for col in base_cols:
             for k in range(1, n_lags + 1):
                 tmp[f"{col}_lag{k}"] = tmp[col].shift(k)
-        # collect all lag feature names
-        lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
 
-        # Drop rows with missing values (any lag or target)
-        tmp = tmp.dropna(subset=[target_col] + lag_cols)
-        if tmp.empty:
+        lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
+        tmp = tmp.dropna(subset=lag_cols + [target_col])
+
+        # Must have data and both classes to fit a classifier
+        if tmp.empty or tmp[target_col].nunique() < 2:
             return np.nan
 
         X_train = tmp[lag_cols].to_numpy(float)
         y_train = tmp[target_col].astype(int).to_numpy()
 
-        # Need both classes to fit logistic regression
-        if np.unique(y_train).size < 2:
-            return np.nan
+        # Choose TabPFN version
         if model_params == "2.5":
-                    clf = TabPFNClassifier(device=device)
+            clf = TabPFNClassifier(device=device)
         else:
-                    clf = TabPFNClassifier.create_default_for_version(
-                        ModelVersion.V2, device=device
-                    )
+            clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, device=device)
 
         clf.fit(X_train, y_train)
 
-        # --- construct lagged features for the current date ---
+        # ---------- PREDICT AT date_t ----------
+        # Build the feature vector for t from the last n_lags values in 'est'
         if len(est) < n_lags:
             return np.nan
 
         lag_values = []
         for col in base_cols:
-            vals = est[col].iloc[-n_lags:]  # last n values
+            vals = est[col].iloc[-n_lags:]  # t-1, t-2, ..., t-n
             if vals.isna().any():
                 return np.nan
             lag_values.extend(vals.values)
-        x_t = np.array(lag_values).reshape(1, -1)
 
-        X_pred = np.array(x_t, dtype=float).reshape(1, -1)
-        y_hat = clf.predict(X_pred)[0]   # class label
+        X_pred = np.asarray(lag_values, dtype=float).reshape(1, -1)
+
+        y_hat = clf.predict(X_pred)[0]
         return int(y_hat)
 
     return fit_predict
