@@ -441,6 +441,7 @@ def expanding_oos_univariate(
     dates = {h: [] for h in range(1, prediction_length+1)}
 
     for date_t in test_idx:
+        print(date_t)
         pos = y.index.get_loc(date_t)
         if isinstance(pos, slice):
             pos = pos.start

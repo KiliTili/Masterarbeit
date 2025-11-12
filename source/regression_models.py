@@ -776,3 +776,112 @@ def tabpfn_ts_oos_fit_each_step(
         mode = mode
     )
     return r2, trues, preds, dates
+
+
+
+# 5.x AutoARIMA (univariate, multi-step)
+def autoarima_oos(
+    data: pd.DataFrame,
+    target_col: str = "equity_premium",
+    start_oos: str = "1965-01-01",
+    freq: str = "MS",
+    prediction_length: int = 1,
+    min_history_months: int = 60,
+    seasonal: bool | None = None,
+    m: int | None = None,
+    ct_cutoff: bool = True,
+    quiet: bool = False,
+    model_name: str = "AutoARIMA",
+    auto_arima_kwargs: dict | None = None,
+    order_search_every: int = None,    # optional: re-search every k steps
+    refit_each_step: bool = True,      # <-- NEW
+    mode: str = "mean",
+):
+    """
+    Expanding-window OOS for pmdarima.auto_arima with optional:
+      - hyperparameter re-search every k steps (order_search_every)
+      - refitting each step using last best (p,d,q)(P,D,Q,m)
+    """
+    from pmdarima import auto_arima, ARIMA
+
+    if auto_arima_kwargs is None:
+        auto_arima_kwargs = {}
+
+    df = ensure_datetime_index(data)
+    y = align_monthly(df[[target_col]], freq=freq, col=target_col)[target_col].astype("float32")
+
+    if seasonal is None:
+        seasonal = freq.upper() in {"M", "MS", "Q", "QS"}
+    if m is None:
+        m = 12 if freq.upper() in {"M", "MS"} else 1
+
+    state = {"order": None, "seasonal_order": None, "step": 0}
+
+    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+        state["step"] += 1
+        y_hist = y_hist.dropna()
+        if len(y_hist) < min_history_months:
+            return np.full(H, np.nan, dtype="float32")
+
+        # --- search or reuse order
+        need_search = (
+            state["order"] is None
+            or state["seasonal_order"] is None
+            or (order_search_every is not None
+                and state["step"] % order_search_every == 1)
+        )
+
+        if need_search:
+            if not quiet:
+                print(f"[AutoARIMA] Searching best order at {date_t.date()}...")
+            model = auto_arima(
+                y_hist.values,
+                seasonal=seasonal,
+                m=m,
+                error_action="ignore",
+                suppress_warnings=True,
+                stepwise=True,
+                **auto_arima_kwargs,
+            )
+            state["order"] = model.order
+            state["seasonal_order"] = model.seasonal_order
+            if not quiet:
+                print(f"  best order={model.order}, seasonal_order={model.seasonal_order}")
+        else:
+            model = ARIMA(
+                order=state["order"],
+                seasonal_order=state["seasonal_order"],
+                seasonal=seasonal,
+                m=m,
+            )
+
+        # --- always refit on current y_hist
+        if refit_each_step:
+            try:
+                model = model.fit(y_hist.values)
+            except Exception as e:
+                if not quiet:
+                    print(f"[AutoARIMA] fit failed at {date_t}: {e}")
+                return np.full(H, np.nan, dtype="float32")
+
+        try:
+            fc = model.predict(n_periods=H)
+        except Exception as e:
+            if not quiet:
+                print(f"[AutoARIMA] predict failed: {e}")
+            return np.full(H, np.nan, dtype="float32")
+
+        return np.asarray(fc, dtype="float32").reshape(-1)[:H]
+
+    r2, trues, preds, dates = expanding_oos_univariate(
+        y,
+        start_oos=start_oos,
+        prediction_length=prediction_length,
+        min_history_months=min_history_months,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        forecast_multi_step_fn=forecast_multi_step,
+        mode=mode,
+    )
+    return r2, trues, preds, dates
