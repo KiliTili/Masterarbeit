@@ -78,304 +78,304 @@ from sklearn.metrics import roc_curve
 
 
 
-def moment_cls_oos(
-    data: pd.DataFrame,
-    feature_cols=("equity_premium",),   # one or many continuous features
-    target_col="equity_premium_c",      # 0/1 target
-    start_oos="2007-01-01",
-    min_context=120,
-    seq_len=256,
-    batch_size=64,
-    epochs_per_step=1,
-    lr=1e-4,
-    quiet=False,
-    model_id="AutonLab/MOMENT-1-small",
-    tune_threshold="youden",            # 'youden' | 'majority' | None
-    use_class_weight=False,
-    train_first_step_only=False,
-    max_steps=None,
-):
-    """
-    Expanding-window one-step-ahead OOS classification with MOMENT.
+# def moment_cls_oos(
+#     data: pd.DataFrame,
+#     feature_cols=("equity_premium",),   # one or many continuous features
+#     target_col="equity_premium_c",      # 0/1 target
+#     start_oos="2007-01-01",
+#     min_context=120,
+#     seq_len=256,
+#     batch_size=64,
+#     epochs_per_step=1,
+#     lr=1e-4,
+#     quiet=False,
+#     model_id="AutonLab/MOMENT-1-small",
+#     tune_threshold="youden",            # 'youden' | 'majority' | None
+#     use_class_weight=False,
+#     train_first_step_only=False,
+#     max_steps=None,
+# ):
+#     """
+#     Expanding-window one-step-ahead OOS classification with MOMENT.
 
-    - Input: past values of one or more continuous features (feature_cols)
-    - Target: binary label (target_col, e.g., Bull/Bear) at time t
-    - Model: MOMENT transformer (sequence classifier)
+#     - Input: past values of one or more continuous features (feature_cols)
+#     - Target: binary label (target_col, e.g., Bull/Bear) at time t
+#     - Model: MOMENT transformer (sequence classifier)
 
-    Parameters
-    ----------
-    data : DataFrame
-        Must contain columns in `feature_cols` and `target_col`.
-        Index should be a DatetimeIndex or convertible to datetime.
-    feature_cols : sequence of str
-        Names of continuous input features. Each becomes one channel.
-    target_col : str
-        Name of binary target column (0/1).
-    start_oos : str or Timestamp
-        First date to start OOS evaluation.
-    min_context : int
-        Minimum number of past observations before first OOS prediction.
-    seq_len : int
-        Length of sequence window fed into MOMENT.
-    batch_size : int
-        Training mini-batch size.
-    epochs_per_step : int
-        Number of epochs per (re)training step.
-    lr : float
-        Learning rate for Adam.
-    tune_threshold : {'youden', 'majority', None}
-        How to choose the classification threshold:
-        - 'youden': maximize TPR - FPR on training windows
-        - 'majority': fraction of class 1 in training windows
-        - None: fixed 0.5
-    use_class_weight : bool
-        If True, use class weights in CrossEntropyLoss.
-    train_first_step_only : bool
-        If True, train only for the first OOS origin and reuse weights.
-    max_steps : int or None
-        Optional cap on number of OOS points (for speed).
+#     Parameters
+#     ----------
+#     data : DataFrame
+#         Must contain columns in `feature_cols` and `target_col`.
+#         Index should be a DatetimeIndex or convertible to datetime.
+#     feature_cols : sequence of str
+#         Names of continuous input features. Each becomes one channel.
+#     target_col : str
+#         Name of binary target column (0/1).
+#     start_oos : str or Timestamp
+#         First date to start OOS evaluation.
+#     min_context : int
+#         Minimum number of past observations before first OOS prediction.
+#     seq_len : int
+#         Length of sequence window fed into MOMENT.
+#     batch_size : int
+#         Training mini-batch size.
+#     epochs_per_step : int
+#         Number of epochs per (re)training step.
+#     lr : float
+#         Learning rate for Adam.
+#     tune_threshold : {'youden', 'majority', None}
+#         How to choose the classification threshold:
+#         - 'youden': maximize TPR - FPR on training windows
+#         - 'majority': fraction of class 1 in training windows
+#         - None: fixed 0.5
+#     use_class_weight : bool
+#         If True, use class weights in CrossEntropyLoss.
+#     train_first_step_only : bool
+#         If True, train only for the first OOS origin and reuse weights.
+#     max_steps : int or None
+#         Optional cap on number of OOS points (for speed).
 
-    Returns
-    -------
-    acc : float
-        OOS accuracy (using time-varying thresholds).
-    brier : float
-        Brier score on predicted probabilities.
-    y_true : np.ndarray
-        True labels at OOS dates.
-    y_prob : np.ndarray
-        Predicted probabilities P(y=1) at OOS dates.
-    thr_arr : np.ndarray
-        Threshold used at each OOS date.
-    dates : DatetimeIndex
-        OOS evaluation dates.
-    """
-    # --------------------
-    # 0. Device
-    # --------------------#
-    try:
-        from momentfm import MOMENTPipeline
-    except Exception as e:
-            raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
+#     Returns
+#     -------
+#     acc : float
+#         OOS accuracy (using time-varying thresholds).
+#     brier : float
+#         Brier score on predicted probabilities.
+#     y_true : np.ndarray
+#         True labels at OOS dates.
+#     y_prob : np.ndarray
+#         Predicted probabilities P(y=1) at OOS dates.
+#     thr_arr : np.ndarray
+#         Threshold used at each OOS date.
+#     dates : DatetimeIndex
+#         OOS evaluation dates.
+#     """
+#     # --------------------
+#     # 0. Device
+#     # --------------------#
+#     try:
+#         from momentfm import MOMENTPipeline
+#     except Exception as e:
+#             raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    if not quiet:
-        print(f"[MOMENT-CLS] device={device}")
+#     if torch.backends.mps.is_available():
+#         device = torch.device("mps")
+#     elif torch.cuda.is_available():
+#         device = torch.device("cuda")
+#     else:
+#         device = torch.device("cpu")
+#     if not quiet:
+#         print(f"[MOMENT-CLS] device={device}")
 
-    # --------------------
-    # 1. Data prep
-    # --------------------
-    if isinstance(feature_cols, str):
-        feature_cols = [feature_cols]
-    else:
-        feature_cols = list(feature_cols)
+#     # --------------------
+#     # 1. Data prep
+#     # --------------------
+#     if isinstance(feature_cols, str):
+#         feature_cols = [feature_cols]
+#     else:
+#         feature_cols = list(feature_cols)
 
-    # ensure datetime index
-    df = data.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
+#     # ensure datetime index
+#     df = data.copy()
+#     if not isinstance(df.index, pd.DatetimeIndex):
+#         df.index = pd.to_datetime(df.index)
 
-    # keep only needed columns, monthly frequency
-    cols_needed = feature_cols + [target_col]
-    df.index = pd.to_datetime(df.timestamp)
+#     # keep only needed columns, monthly frequency
+#     cols_needed = feature_cols + [target_col]
+#     df.index = pd.to_datetime(df.timestamp)
 
-    X_df = df[feature_cols].astype("float32")  # (T, F)
-    y_cls = df[target_col].astype("int64")     # (T,)
+#     X_df = df[feature_cols].astype("float32")  # (T, F)
+#     y_cls = df[target_col].astype("int64")     # (T,)
 
-    n_channels = len(feature_cols)
+#     n_channels = len(feature_cols)
 
-    start_oos = pd.Timestamp(start_oos)
-    test_idx = y_cls.index[y_cls.index >= start_oos]
+#     start_oos = pd.Timestamp(start_oos)
+#     test_idx = y_cls.index[y_cls.index >= start_oos]
 
-    # --------------------
-    # 2. Model init
-    # --------------------
-    model = MOMENTPipeline.from_pretrained(
-        model_id,
-        model_kwargs={
-            "task_name": "classification",
-            "n_channels": n_channels,
-            "num_class": 2,
-        },
-    )
-    model.init()
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+#     # --------------------
+#     # 2. Model init
+#     # --------------------
+#     model = MOMENTPipeline.from_pretrained(
+#         model_id,
+#         model_kwargs={
+#             "task_name": "classification",
+#             "n_channels": n_channels,
+#             "num_class": 2,
+#         },
+#     )
+#     model.init()
+#     model.to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # --------------------
-    # 3. Helpers
-    # --------------------
-    def make_windows(upto_pos: int):
-        """
-        Build training windows from history up to (but not including) upto_pos.
+#     # --------------------
+#     # 3. Helpers
+#     # --------------------
+#     def make_windows(upto_pos: int):
+#         """
+#         Build training windows from history up to (but not including) upto_pos.
 
-        Returns
-        -------
-        X_train : torch.Tensor, shape (N, n_channels, seq_len)
-        y_train : torch.Tensor, shape (N,)
-        """
-        X_hist = X_df.iloc[:upto_pos].to_numpy(dtype=np.float32)  # (T_hist, F)
-        y_hist = y_cls.iloc[:upto_pos].to_numpy(dtype=np.int64)
+#         Returns
+#         -------
+#         X_train : torch.Tensor, shape (N, n_channels, seq_len)
+#         y_train : torch.Tensor, shape (N,)
+#         """
+#         X_hist = X_df.iloc[:upto_pos].to_numpy(dtype=np.float32)  # (T_hist, F)
+#         y_hist = y_cls.iloc[:upto_pos].to_numpy(dtype=np.int64)
 
-        T_hist = X_hist.shape[0]
-        if T_hist <= seq_len:
-            return None, None
+#         T_hist = X_hist.shape[0]
+#         if T_hist <= seq_len:
+#             return None, None
 
-        windows, labels = [], []
-        for t in range(seq_len, T_hist):
-            # slice window for all features: (seq_len, F), then transpose -> (F, seq_len)
-            w = X_hist[t - seq_len : t, :].T
-            windows.append(w)
-            labels.append(y_hist[t])
+#         windows, labels = [], []
+#         for t in range(seq_len, T_hist):
+#             # slice window for all features: (seq_len, F), then transpose -> (F, seq_len)
+#             w = X_hist[t - seq_len : t, :].T
+#             windows.append(w)
+#             labels.append(y_hist[t])
 
-        if not windows:
-            return None, None
+#         if not windows:
+#             return None, None
 
-        X_train = torch.from_numpy(np.stack(windows)).float()  # (N, F, L)
-        y_train = torch.from_numpy(np.asarray(labels, dtype=np.int64))
-        return X_train, y_train
+#         X_train = torch.from_numpy(np.stack(windows)).float()  # (N, F, L)
+#         y_train = torch.from_numpy(np.asarray(labels, dtype=np.int64))
+#         return X_train, y_train
 
-    def make_ctx(upto_pos: int):
-        """
-        Build single context window for prediction at position upto_pos.
+#     def make_ctx(upto_pos: int):
+#         """
+#         Build single context window for prediction at position upto_pos.
 
-        Returns
-        -------
-        x_ctx : torch.Tensor, shape (1, n_channels, seq_len)
-        """
-        X_hist = X_df.iloc[:upto_pos].to_numpy(dtype=np.float32)  # (T_hist, F)
-        T_hist = X_hist.shape[0]
+#         Returns
+#         -------
+#         x_ctx : torch.Tensor, shape (1, n_channels, seq_len)
+#         """
+#         X_hist = X_df.iloc[:upto_pos].to_numpy(dtype=np.float32)  # (T_hist, F)
+#         T_hist = X_hist.shape[0]
 
-        if T_hist >= seq_len:
-            ctx = X_hist[T_hist - seq_len : T_hist, :]  # (seq_len, F)
-        else:
-            pad = np.zeros((seq_len - T_hist, n_channels), dtype=np.float32)
-            ctx = np.vstack([pad, X_hist])             # (seq_len, F)
+#         if T_hist >= seq_len:
+#             ctx = X_hist[T_hist - seq_len : T_hist, :]  # (seq_len, F)
+#         else:
+#             pad = np.zeros((seq_len - T_hist, n_channels), dtype=np.float32)
+#             ctx = np.vstack([pad, X_hist])             # (seq_len, F)
 
-        ctx = ctx.T.reshape(1, n_channels, seq_len)    # (1, F, L)
-        return torch.from_numpy(ctx).float()
+#         ctx = ctx.T.reshape(1, n_channels, seq_len)    # (1, F, L)
+#         return torch.from_numpy(ctx).float()
 
-    def train_on_history(X_train: torch.Tensor, y_train: torch.Tensor, epochs: int):
-        if use_class_weight:
-            n1 = int((y_train == 1).sum().item())
-            n0 = int((y_train == 0).sum().item())
-            w0 = (n1 + n0) / (2.0 * max(1, n0))
-            w1 = (n1 + n0) / (2.0 * max(1, n1))
-            class_weight = torch.tensor([w0, w1], dtype=torch.float32, device=device)
-            criterion = nn.CrossEntropyLoss(weight=class_weight)
-        else:
-            criterion = nn.CrossEntropyLoss()
+#     def train_on_history(X_train: torch.Tensor, y_train: torch.Tensor, epochs: int):
+#         if use_class_weight:
+#             n1 = int((y_train == 1).sum().item())
+#             n0 = int((y_train == 0).sum().item())
+#             w0 = (n1 + n0) / (2.0 * max(1, n0))
+#             w1 = (n1 + n0) / (2.0 * max(1, n1))
+#             class_weight = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+#             criterion = nn.CrossEntropyLoss(weight=class_weight)
+#         else:
+#             criterion = nn.CrossEntropyLoss()
 
-        train_loader = DataLoader(
-            TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True
-        )
+#         train_loader = DataLoader(
+#             TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True
+#         )
 
-        model.train()
-        for _ in range(epochs):
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                xb.requires_grad_(True)
-                out = model(x_enc=xb)
-                loss = criterion(out.logits, yb)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+#         model.train()
+#         for _ in range(epochs):
+#             for xb, yb in train_loader:
+#                 xb, yb = xb.to(device), yb.to(device)
+#                 xb.requires_grad_(True)
+#                 out = model(x_enc=xb)
+#                 loss = criterion(out.logits, yb)
+#                 optimizer.zero_grad()
+#                 loss.backward()
+#                 optimizer.step()
 
-    def predict_proba(x_ctx: torch.Tensor) -> float:
-        """
-        Predict P(y=1) for a single context window.
-        x_ctx: shape (1, n_channels, seq_len)
-        """
-        model.eval()
-        with torch.inference_mode():
-            xb = x_ctx.to(device)
-            logits = model(x_enc=xb).logits
-            p1 = torch.softmax(logits, dim=1)[0, 1].item()
-        return float(p1)
+#     def predict_proba(x_ctx: torch.Tensor) -> float:
+#         """
+#         Predict P(y=1) for a single context window.
+#         x_ctx: shape (1, n_channels, seq_len)
+#         """
+#         model.eval()
+#         with torch.inference_mode():
+#             xb = x_ctx.to(device)
+#             logits = model(x_enc=xb).logits
+#             p1 = torch.softmax(logits, dim=1)[0, 1].item()
+#         return float(p1)
 
-    # --------------------
-    # 4. Expanding OOS loop
-    # --------------------
-    probs, trues, dates, thr_list = [], [], [], []
-    has_trained_once = False
-    step_count = 0
+#     # --------------------
+#     # 4. Expanding OOS loop
+#     # --------------------
+#     probs, trues, dates, thr_list = [], [], [], []
+#     has_trained_once = False
+#     step_count = 0
 
-    for date_t in test_idx:
-        step_count += 1
-        if max_steps is not None and step_count > max_steps:
-            break
-        if not quiet:
-            print(date_t)
+#     for date_t in test_idx:
+#         step_count += 1
+#         if max_steps is not None and step_count > max_steps:
+#             break
+#         if not quiet:
+#             print(date_t)
 
-        pos = y_cls.index.get_loc(date_t)
-        # ensure enough past data & room for seq_len
-        if pos < max(min_context, seq_len + 1):
-            continue
+#         pos = y_cls.index.get_loc(date_t)
+#         # ensure enough past data & room for seq_len
+#         if pos < max(min_context, seq_len + 1):
+#             continue
 
-        # --- build training windows from past only ---
-        X_train, y_train = make_windows(upto_pos=pos)
-        if X_train is None or len(X_train) < 10 or len(torch.unique(y_train)) < 2:
-            continue
+#         # --- build training windows from past only ---
+#         X_train, y_train = make_windows(upto_pos=pos)
+#         if X_train is None or len(X_train) < 10 or len(torch.unique(y_train)) < 2:
+#             continue
 
-        # --- training (once or every step) ---
-        if (not train_first_step_only) or (train_first_step_only and not has_trained_once):
-            train_on_history(X_train, y_train, epochs_per_step)
-            has_trained_once = True
+#         # --- training (once or every step) ---
+#         if (not train_first_step_only) or (train_first_step_only and not has_trained_once):
+#             train_on_history(X_train, y_train, epochs_per_step)
+#             has_trained_once = True
 
-        # --- threshold tuning on training windows ---
-        thr = 0.5
-        if tune_threshold is not None:
-            model.eval()
-            with torch.inference_mode():
-                p_tr_list = []
-                loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size)
-                for xb, yb in loader:
-                    xb = xb.to(device)
-                    logits = model(x_enc=xb).logits
-                    pr = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-                    p_tr_list.append(pr)
-                p_tr = np.concatenate(p_tr_list)
-                y_tr = y_train.numpy()
+#         # --- threshold tuning on training windows ---
+#         thr = 0.5
+#         if tune_threshold is not None:
+#             model.eval()
+#             with torch.inference_mode():
+#                 p_tr_list = []
+#                 loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size)
+#                 for xb, yb in loader:
+#                     xb = xb.to(device)
+#                     logits = model(x_enc=xb).logits
+#                     pr = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+#                     p_tr_list.append(pr)
+#                 p_tr = np.concatenate(p_tr_list)
+#                 y_tr = y_train.numpy()
 
-            if tune_threshold == "majority":
-                thr = float(y_tr.mean())
-            elif tune_threshold == "youden":
-                fpr, tpr, th = roc_curve(y_tr, p_tr)
-                j = tpr - fpr
-                thr = float(th[np.argmax(j)]) if len(th) else 0.5
+#             if tune_threshold == "majority":
+#                 thr = float(y_tr.mean())
+#             elif tune_threshold == "youden":
+#                 fpr, tpr, th = roc_curve(y_tr, p_tr)
+#                 j = tpr - fpr
+#                 thr = float(th[np.argmax(j)]) if len(th) else 0.5
 
-        thr_list.append(thr)
+#         thr_list.append(thr)
 
-        # --- predict one-step ahead at date_t ---
-        x_ctx = make_ctx(upto_pos=pos)
-        p1 = predict_proba(x_ctx)
+#         # --- predict one-step ahead at date_t ---
+#         x_ctx = make_ctx(upto_pos=pos)
+#         p1 = predict_proba(x_ctx)
 
-        probs.append(float(p1))
-        trues.append(int(y_cls.iloc[pos]))
-        dates.append(date_t)
+#         probs.append(float(p1))
+#         trues.append(int(y_cls.iloc[pos]))
+#         dates.append(date_t)
 
-    if not probs:
-        raise RuntimeError("No valid MOMENT predictions; increase history / adjust start_oos / min_context.")
+#     if not probs:
+#         raise RuntimeError("No valid MOMENT predictions; increase history / adjust start_oos / min_context.")
 
-    y_prob = np.asarray(probs, float)
-    y_true = np.asarray(trues, int)
-    thr_arr = np.asarray(thr_list, float)
-    dates = pd.DatetimeIndex(dates)
+#     y_prob = np.asarray(probs, float)
+#     y_true = np.asarray(trues, int)
+#     thr_arr = np.asarray(thr_list, float)
+#     dates = pd.DatetimeIndex(dates)
 
-    # --- apply variable threshold ---
-    y_hat = (y_prob >= thr_arr).astype(int)
-    acc = (y_hat == y_true).mean()
-    brier = np.mean((y_prob - y_true) ** 2)
+#     # --- apply variable threshold ---
+#     y_hat = (y_prob >= thr_arr).astype(int)
+#     acc = (y_hat == y_true).mean()
+#     brier = np.mean((y_prob - y_true) ** 2)
 
-    if not quiet:
-        print(f"[MOMENT-CLS] steps={len(y_true)}  Acc={acc:.4f}  Brier={brier:.4f}")
+#     if not quiet:
+#         print(f"[MOMENT-CLS] steps={len(y_true)}  Acc={acc:.4f}  Brier={brier:.4f}")
 
-    return acc, brier, y_true, y_prob, thr_arr, dates
+#     return acc, brier, y_true, y_prob, thr_arr, dates, y_hat
 
 
 
@@ -512,3 +512,187 @@ def tabpfn_cls_oos(
     )
 
     return metrics, y_true, y_pred, dates
+
+
+
+from typing import Callable
+import numpy as np
+import pandas as pd
+
+def make_moment_fit_predict_fn(
+    feature_cols,
+    target_col="state",
+    seq_len=256,
+    batch_size=64,
+    epochs=1,
+    lr=1e-4,
+    model_id="AutonLab/MOMENT-1-small",
+    tune_threshold="youden",
+    use_class_weight=False,
+    retrain_every=5,          # <--- NEW: retrain frequency
+):
+    """
+    MOMENT classifier fit_predict function for expanding_oos_tabular_cls,
+    with retraining every `retrain_every` steps instead of every step.
+    """
+
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+    from sklearn.metrics import roc_curve
+    from momentfm import MOMENTPipeline
+    from torch.nn.utils import clip_grad_norm_
+
+    if isinstance(feature_cols, str):
+        feature_cols = [feature_cols]
+    n_channels = len(feature_cols)
+
+    # Choose device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    # ----------- Persistent state inside closure -----------
+    model = None
+    optimizer = None
+    step_counter = 0
+    last_thr = 0.5
+
+    # ----------- Helper functions -----------
+    def _make_windows(X_df, y_ser):
+        X_hist = X_df.to_numpy(dtype=np.float32)
+        y_hist = y_ser.to_numpy(dtype=np.int64)
+        T_hist = X_hist.shape[0]
+        if T_hist <= seq_len:
+            return None, None
+        windows, labels = [], []
+        for t in range(seq_len, T_hist):
+            w = X_hist[t - seq_len : t, :].T
+            windows.append(w)
+            labels.append(y_hist[t])
+        X_train = torch.from_numpy(np.stack(windows)).float()
+        y_train = torch.from_numpy(np.asarray(labels, np.int64))
+        return X_train, y_train
+
+    def _make_ctx(X_df):
+        X_hist = X_df.to_numpy(dtype=np.float32)
+        T_hist = X_hist.shape[0]
+        if T_hist == 0:
+            return None
+        if T_hist >= seq_len:
+            ctx = X_hist[T_hist - seq_len : T_hist, :]
+        else:
+            pad = np.zeros((seq_len - T_hist, n_channels), dtype=np.float32)
+            ctx = np.vstack([pad, X_hist])
+        return torch.from_numpy(ctx.T.reshape(1, n_channels, seq_len)).float()
+
+    # ----------- The core fit_predict() function -----------
+    def fit_predict(est, row_t):
+        nonlocal model, optimizer, step_counter, last_thr
+        step_counter += 1
+
+        # Prepare data
+        df = est.copy()
+        X_df = df[feature_cols].astype("float32")
+        y_ser = df[target_col].astype("int64")
+
+        # Skip if insufficient data
+        if len(df) <= seq_len or y_ser.nunique() < 2:
+            return np.nan
+
+        # Retrain every `retrain_every` steps or if no model yet
+        if (model is None) or (step_counter % retrain_every == 0):
+            X_train, y_train = _make_windows(X_df, y_ser)
+            if X_train is None or len(X_train) < 10:
+                return np.nan
+
+            model = MOMENTPipeline.from_pretrained(
+                model_id,
+                model_kwargs={"task_name": "classification", "n_channels": n_channels, "num_class": 2},
+            )
+            model.init()
+            model.to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+            
+            # Loss
+            if use_class_weight:
+                n1 = int((y_train == 1).sum().item())
+                n0 = int((y_train == 0).sum().item())
+                w0 = (n1 + n0) / (2.0 * max(1, n0))
+                w1 = (n1 + n0) / (2.0 * max(1, n1))
+                class_weight = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+                criterion = nn.CrossEntropyLoss(weight=class_weight)
+            else:
+                criterion = nn.CrossEntropyLoss()
+
+            # Train
+            train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+            model.train()
+            num_updates = max(1, len(train_loader) * epochs)
+            warmup = max(1, int(0.05 * num_updates))  # 5% warmup
+            def lr_lambda(step):
+                if step < warmup:
+                    return float(step + 1) / warmup
+                # cosine decay to 10% of base lr
+                progress = (step - warmup) / max(1, num_updates - warmup)
+                return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+            for epoch in range(epochs):
+                running_loss = 0.0
+                batch_count = 0
+
+                for xb, yb in train_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    xb.requires_grad_(True)
+                    out = model(x_enc=xb)
+                    loss = criterion(out.logits, yb)
+                    optimizer.zero_grad()
+
+                    loss.backward()
+                    clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    running_loss += loss.item()
+                    batch_count += 1
+                avg_loss = running_loss / max(1, batch_count)
+                print(f"[MOMENT retrain] Epoch {epoch + 1}/{epochs} | Avg loss = {avg_loss:.6f}")
+            # Tune threshold on training data
+            if tune_threshold is not None:
+                model.eval()
+                with torch.inference_mode():
+                    preds = []
+                    loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size)
+                    for xb, _ in loader:
+                        xb = xb.to(device)
+                        logits = model(x_enc=xb).logits
+                        p1 = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                        preds.append(p1)
+                    p_tr = np.concatenate(preds)
+                    y_tr = y_train.numpy()
+
+                if tune_threshold == "majority":
+                    last_thr = float(y_tr.mean())
+                elif tune_threshold == "youden":
+                    fpr, tpr, th = roc_curve(y_tr, p_tr)
+                    j = tpr - fpr
+                    last_thr = float(th[np.argmax(j)]) if len(th) else 0.5
+                else:
+                    last_thr = 0.5
+
+        # Predict
+        x_ctx = _make_ctx(X_df)
+        if x_ctx is None or model is None:
+            return np.nan
+        model.eval()
+        with torch.inference_mode():
+            xb = x_ctx.to(device)
+            logits = model(x_enc=xb).logits
+            p1 = torch.softmax(logits, dim=1)[0, 1].item()
+
+        return int(p1 >= last_thr)
+
+    return fit_predict
