@@ -355,6 +355,7 @@ def expanding_oos_tabular(
     preds, trues, oos_dates = [], [], []
 
     for date_t in loop_dates:
+        print( date_t)
         pos = df.index.get_loc(date_t)
         est = df.iloc[:pos].copy()        # strictly past
         row_t = df.iloc[pos]
