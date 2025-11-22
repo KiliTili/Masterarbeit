@@ -387,7 +387,7 @@ def make_tabpfn_lag_cls_fit_predict_fn(
     base_cols,
     target_col: str = "state",    # 0/1 (Bull/Bear)
     n_lags: int = 1,
-    min_train: int = 120,
+    retrain_every = 1,
     model_params=None,            # e.g. "2.5" to mimic your reg code
 ):
     """
@@ -406,7 +406,11 @@ def make_tabpfn_lag_cls_fit_predict_fn(
 
     base_cols = list(base_cols)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    step_counter = 0
+    clf = None
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        nonlocal step_counter, clf
+        step_counter += 1
         # Need enough history to build lags
         if len(est) <= n_lags:
             return np.nan
@@ -429,12 +433,14 @@ def make_tabpfn_lag_cls_fit_predict_fn(
         y_train = tmp[target_col].astype(int).to_numpy()
 
         # Choose TabPFN version
-        if model_params == "2.5":
-            clf = TabPFNClassifier(device=device)
-        else:
-            clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, device=device)
+        if (clf is None) or (step_counter % retrain_every == 0):
+                
+            if model_params == "2.5":
+                clf = TabPFNClassifier(device=device)
+            else:
+                clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, device=device)
 
-        clf.fit(X_train, y_train)
+            clf.fit(X_train, y_train)
 
         # ---------- PREDICT AT date_t ----------
         # Build the feature vector for t from the last n_lags values in 'est'
@@ -468,6 +474,7 @@ def tabpfn_cls_oos(
     model_name: str = "TabPFN-CLS-lag",
     baseline_mode: str = "majority",
     model_params=None,           # e.g. "2.5"
+    retrain_every = 1,
 ):
     """
     Expanding-window 1-step-ahead OOS CLASSIFICATION with TabPFN.
@@ -493,8 +500,8 @@ def tabpfn_cls_oos(
         base_cols=base_cols,
         target_col=target_col,
         n_lags=n_lags,
-        min_train=min_train,
         model_params=model_params,
+        retrain_every = retrain_every,
     )
 
     # plug into your generic classification OOS driver
