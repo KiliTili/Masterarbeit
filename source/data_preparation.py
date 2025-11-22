@@ -68,10 +68,10 @@ def convert_stationary_variables_with_log(df, var):
     return df
 
 
-def label_states(df_diff, variable='M1WO', n_states=2, quiet=True, plot = True):
+def label_states(df_diff, variable='M1WO', n_states=2, quiet=True, plot = True, random_state =42):
     returns = df_diff[variable].dropna().values.reshape(-1, 1)
 
-    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=1000, random_state = 42) #full does not matter
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=1000, random_state = random_state) #full does not matter
     model.fit(returns)
 
     trans_mat = model.transmat_
@@ -121,12 +121,12 @@ def label_states(df_diff, variable='M1WO', n_states=2, quiet=True, plot = True):
     return df_states
 
 
-def create_classification_data(file_path="../../Data/GoyalAndWelch.xlsx", quiet=True):
+def create_classification_data(file_path="../../Data/GoyalAndWelch.xlsx", quiet=True, random_state=42):
     df = pd.read_csv("../../Data/MSCI_World_Data.csv")
     df_diff = difference_over_variables(df)
     df_diff['timestamp'] = pd.to_datetime(df_diff['timestamp'])
 
-    df_states = label_states(df_diff, quiet=quiet)
+    df_states = label_states(df_diff, quiet=quiet, random_state=random_state)
     return df_states
 
 

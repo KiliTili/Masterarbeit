@@ -12,6 +12,64 @@ import torch
 from collections import Counter
 import numpy as np
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
+import numpy as np
+from sklearn.metrics import r2_score
+
+def calculate_block_bootstrap_stats(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    baseline_pred: np.ndarray,
+    block_size: int = 12,      # 12 months block size to preserve seasonality
+    n_bootstraps: int = 1000
+) -> dict:
+    """
+    Performs block bootstrapping on the *errors* of the model vs baseline
+    to estimate the distribution of the R2 metric.
+    """
+    n_samples = len(y_true)
+    r2_bootstraps = []
+    
+    # 1. Calculate Error Vectors (Residuals squared)
+    # We bootstrap these errors to preserve the correlation structure
+    err_model = (y_true - y_pred) ** 2
+    err_baseline = (y_true - baseline_pred) ** 2
+
+    for _ in range(n_bootstraps):
+        # 2. Generate Block Indices
+        indices = []
+        while len(indices) < n_samples:
+            start_idx = np.random.randint(0, n_samples - block_size + 1)
+            # Select a contiguous block
+            indices.extend(range(start_idx, start_idx + block_size))
+        
+        # Trim to original length
+        indices = np.array(indices[:n_samples])
+
+        # 3. Calculate R2 for this specific bootstrap sample
+        # Sum of squared errors for the sample
+        sse_model = np.sum(err_model[indices])
+        sse_baseline = np.sum(err_baseline[indices])
+        
+        # Avoid division by zero
+        if sse_baseline > 1e-9:
+            r2_sample = 1 - (sse_model / sse_baseline)
+        else:
+            r2_sample = np.nan
+            
+        r2_bootstraps.append(r2_sample)
+
+    # 4. Aggregate Statistics
+    r2_bootstraps = np.array([x for x in r2_bootstraps if not np.isnan(x)])
+    
+    if len(r2_bootstraps) == 0:
+        return {"std": np.nan, "lower": np.nan, "upper": np.nan}
+
+    return {
+        "mean": np.mean(r2_bootstraps),
+        "std": np.std(r2_bootstraps),
+        "lower": np.percentile(r2_bootstraps, 2.5),   # 95% Confidence Interval
+        "upper": np.percentile(r2_bootstraps, 97.5)
+    }
 
 
 
@@ -122,34 +180,93 @@ def baseline_classification(y_true, mode: str = "majority"):
     else:
         raise ValueError(f"Unknown baseline mode: {mode}")
 
-def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, mode: str = "mean",):
+
+
+def evaluate_oos(
+    y_true, 
+    y_pred, 
+    model_name="Model", 
+    device="cpu", 
+    quiet=False, 
+    mode: str = "mean"
+):
     """
     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
     using the expanding mean as the benchmark forecast.
+    
+    Returns: (r2_oos_point_estimate, bootstrap_stats_dict)
     """
     y_true = np.asarray(y_true, float)
     y_pred = np.asarray(y_pred, float)
 
+    # Filter NaNs
     m = ~np.isnan(y_true) & ~np.isnan(y_pred)
     y_true, y_pred = y_true[m], y_pred[m]
 
     if len(y_true) == 0:
         if not quiet:
             print(f"[{model_name}] No valid predictions (all NaN).")
-        return np.nan
+        return np.nan, {}
 
+    # 1. Standard Point Estimates
     mse = mean_squared_error(y_true, y_pred)
     rmse = float(np.sqrt(mse))
 
+    # Generate the Baseline Prediction Vector
+    # (Assuming baseline_forecast returns an array of shape y_true)
     mean_forecast = baseline_forecast(y_true, mode=mode)
+    
     denom = np.sum((y_true - mean_forecast) ** 2)
-    r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom) if denom > 0 else np.nan
+    
+    if denom > 0:
+        r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom)
+    else:
+        r2_oos = np.nan
+
+    # 2. Calculate Bootstrap Statistics (New Part)
+    stats = calculate_block_bootstrap_stats(
+        y_true, 
+        y_pred, 
+        mean_forecast, 
+        block_size=12, 
+        n_bootstraps=1000
+    )
 
     if not quiet:
-        print(f"[{model_name}] Device={device} | Valid months={len(y_true)} | "
-              f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
+        print(f"[{model_name}] Valid={len(y_true)} | "
+              f"MSE={mse:.6f} | "
+              f"R²_OS={r2_oos:.4f} (±{stats['std']:.4f})")
 
-    return r2_oos
+    # Return both the point estimate and the stats dictionary
+    return r2_oos, stats
+# def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, mode: str = "mean",):
+#     """
+#     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
+#     using the expanding mean as the benchmark forecast.
+#     """
+#     y_true = np.asarray(y_true, float)
+#     y_pred = np.asarray(y_pred, float)
+
+#     m = ~np.isnan(y_true) & ~np.isnan(y_pred)
+#     y_true, y_pred = y_true[m], y_pred[m]
+
+#     if len(y_true) == 0:
+#         if not quiet:
+#             print(f"[{model_name}] No valid predictions (all NaN).")
+#         return np.nan
+
+#     mse = mean_squared_error(y_true, y_pred)
+#     rmse = float(np.sqrt(mse))
+
+#     mean_forecast = baseline_forecast(y_true, mode=mode)
+#     denom = np.sum((y_true - mean_forecast) ** 2)
+#     r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom) if denom > 0 else np.nan
+
+#     if not quiet:
+#         print(f"[{model_name}] Device={device} | Valid months={len(y_true)} | "
+#               f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
+
+#     return r2_oos
 def evaluate_oos_classification(
     y_true,
     y_pred,
