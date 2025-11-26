@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.abspath('../'))
 
-from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular, expanding_oos_univariate,plot_oos
+from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular
 import torch
 # ================================================================
 # 1. OLS & RANKING (1-step tabular)
@@ -689,14 +689,6 @@ def tabpfn_oos_fit_each_step(
         mode=mode,
     )
 
-
-import numpy as np
-import pandas as pd
-
-import pandas as pd
-import numpy as np
-import torch
-from tabpfn import TabPFNRegressor
 
 def add_ts_features(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, list]:
     """

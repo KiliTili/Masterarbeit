@@ -697,10 +697,13 @@ class MLPCls(nn.Module):
     def __init__(self, d_in):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_in, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(d_in, 128),          # <<< GEÄNDERT (vorher 64)
+            nn.ReLU(),
+            nn.BatchNorm1d(128),           # <<< GEÄNDERT (neu hinzugefügt)
+            nn.Dropout(0.2),               # <<< GEÄNDERT (neu hinzugefügt)
+            nn.Linear(128, 64),            # <<< GEÄNDERT (vorher 32)
+            nn.ReLU(),
+            nn.Linear(64, 1),              # <<< GEÄNDERT (vorher 16 -> 1)
         )
     def forward(self, x):  # [B, d_in]
         return self.net(x).squeeze(-1)  # logits
@@ -717,9 +720,14 @@ def make_mlp_lag_cls_fit_predict_fn(
     class_weight: bool = False,     # use balanced loss
     return_proba: bool = False,
     print_loss: bool = True,
+    price_path: bool = False,
 ):
     base_cols = list(base_cols)
-    d_in = len(base_cols) * n_lags
+    if price_path:                   
+        feature_col = base_cols[0]   
+        d_in = n_lags                
+    else:                            
+        d_in = len(base_cols) * n_lags
 
     if torch.backends.mps.is_available(): device = torch.device("mps")
     elif torch.cuda.is_available(): device = torch.device("cuda")
@@ -739,7 +747,80 @@ def make_mlp_lag_cls_fit_predict_fn(
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
         nonlocal model, scaler, step
         step += 1
+        if price_path:                                                   # <<< NEW
+            if len(est) <= n_lags or est[target_col].nunique() < 2:      # <<< NEW
+                return np.nan                                            # <<< NEW
 
+            series = est[feature_col].astype("float32").to_numpy()       # <<< NEW
+            labels = est[target_col].astype("float32").to_numpy()        # <<< NEW
+
+            # (re)train periodically
+            if (model is None) or (step % retrain_every == 0):           # <<< NEW
+                X_list, y_list = [], []                                  # <<< NEW
+
+                for i in range(n_lags, len(series)):                     # <<< NEW
+                    w = series[i - n_lags : i]                           # <<< NEW
+                    if np.isnan(w).any():                                # <<< NEW
+                        continue                                         # <<< NEW
+                    X_list.append(np.cumsum(w))                          # <<< NEW: PRICE PATH window
+                    y_list.append(labels[i])                             # <<< NEW
+
+                if len(X_list) < 20 or len(set(y_list)) < 2:             # <<< NEW
+                    return np.nan                                        # <<< NEW
+
+                X_train = np.stack(X_list).astype("float32")             # <<< NEW
+                y_train = np.array(y_list).astype("float32")             # <<< NEW
+
+                scaler = StandardScaler().fit(X_train)                   # <<< NEW
+                Xs = scaler.transform(X_train).astype("float32")         # <<< NEW
+
+                ds = TensorDataset(torch.from_numpy(Xs), torch.from_numpy(y_train))  # <<< NEW
+                loader = DataLoader(ds, batch_size=batch_size, shuffle=True)        # <<< NEW
+
+                model = MLPCls(d_in=d_in).to(device)                     # <<< NEW
+                opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)  # <<< NEW
+
+                if class_weight:                                         # <<< NEW
+                    pos = max(1.0, float((y_train == 1).sum()))          # <<< NEW
+                    neg = max(1.0, float((y_train == 0).sum()))          # <<< NEW
+                    w_pos = (pos + neg) / (2.0 * pos)                    # <<< NEW
+                    w_neg = (pos + neg) / (2.0 * neg)                    # <<< NEW
+                    crit = nn.BCEWithLogitsLoss(                         # <<< NEW
+                        pos_weight=torch.tensor([w_pos / w_neg], device=device)
+                    )
+                else:                                                    # <<< NEW
+                    crit = nn.BCEWithLogitsLoss()                        # <<< NEW
+
+                model.train()                                            # <<< NEW
+                for ep in range(epochs):                                 # <<< NEW
+                    run, nb = 0.0, 0                                     # <<< NEW
+                    for xb, yb in loader:                                # <<< NEW
+                        xb, yb = xb.to(device), yb.to(device)            # <<< NEW
+                        logit = model(xb)                                # <<< NEW
+                        loss = crit(logit, yb)                           # <<< NEW
+                        opt.zero_grad()                                  # <<< NEW
+                        loss.backward()                                  # <<< NEW
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)# <<< NEW
+                        opt.step()                                       # <<< NEW
+                        run += loss.item()                               # <<< NEW
+                        nb += 1                                          # <<< NEW
+                    if print_loss:                                       # <<< NEW
+                        print(f"[MLPCls (price_path) retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")  # <<< NEW
+
+            # ---- Prediction in price-path mode ----                 # <<< NEW
+            window = series[-n_lags:]                                   # <<< NEW
+            if np.isnan(window).any() or len(window) < n_lags:          # <<< NEW
+                return np.nan                                           # <<< NEW
+
+            x_t = np.cumsum(window).reshape(1, -1)                      # <<< NEW
+            x_tn = scaler.transform(x_t).astype("float32")              # <<< NEW
+            x_tn = torch.from_numpy(x_tn).to(device)                    # <<< NEW
+
+            model.eval()                                                # <<< NEW
+            with torch.inference_mode():                                # <<< NEW
+                p1 = torch.sigmoid(model(x_tn)).item()                  # <<< NEW
+
+            return float(p1) if return_proba else int(p1 >= 0.5) 
         tmp, lag_cols = build_lagged(est)
         if tmp.empty or tmp[target_col].nunique() < 2:
             return np.nan
@@ -1011,7 +1092,7 @@ def make_chronos_forecast_mlp_cls_fn(
     feature_col: str = "equity_premium",
     target_col: str = "state_true",
     seq_len: int = 64,          # History length
-    pred_len: int = 12,         # How far to ask Chronos to look ahead
+    pred_len: int = 12,         # How far to ask Chronos to look ahead (0 = no Chronos)
     epochs: int = 10,
     batch_size: int = 32,
     lr: float = 1e-3,
@@ -1021,127 +1102,144 @@ def make_chronos_forecast_mlp_cls_fn(
     train_window_limit: int = 300 # Only train MLP on last N samples to save time
 ):
     # ---- Device Setup ----
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if torch.backends.mps.is_available(): device = "mps"
+    from chronos import BaseChronosPipeline          # <<< NEW (if not imported globally)
+
+    if torch.backends.mps.is_available():            # <<< CHANGED
+        device = torch.device("mps")                 # <<< CHANGED
+    elif torch.cuda.is_available():                  # <<< CHANGED
+        device = torch.device("cuda")                # <<< CHANGED
+    else:                                            # <<< CHANGED
+        device = torch.device("cpu")                 # <<< CHANGED
 
     # ---- Persistent State ----
-    # We cache the generated features (History + Forecast) so we don't 
-    # run Chronos 2000 times every loop.
+    # If pred_len == 0, we will *not* use pipe at all.
     state = {
         "pipe": None,
         "mlp": None,
         "optimizer": None,
         "loss_fn": None,
-        "feature_cache": {}, # Maps timestamp -> numpy array of (seq_len + pred_len)
+        "feature_cache": {}, # Maps timestamp -> numpy array of features
         "step": 0
     }
 
     # ---- Helper: Feature Generator (The Core Logic) ----
     def get_augmented_features(series_window, timestamp):
         """
-        Runs Chronos Bolt to get a forecast, then combines 
-        Past + Forecast into one feature vector.
+        If pred_len > 0:
+            Runs Chronos Bolt to get a forecast, then combines 
+            Past + Forecast into one feature vector.
+        If pred_len == 0:
+            Only returns normalized price path (no Chronos).
         """
-        # 1. Check Cache
-        if timestamp in state["feature_cache"]:
-            return state["feature_cache"][timestamp]
+        # Ensure numpy float array
+        series_window = np.asarray(series_window, dtype="float32")       # <<< NEW
 
-        # 2. Prepare Input (Cumulative Sum Price Path)
-        # Chronos needs 'price' shapes, not returns noise.
-        price_path = np.cumsum(series_window)
-        
+        # 1. Price path from returns
+        price_path = np.cumsum(series_window)                            # (unchanged idea)
+
+        # ------------ CASE 1: pred_len == 0  (NO CHRONOS) --------------
+        if pred_len <= 0:                                                # <<< NEW
+            combined = price_path - price_path[0]                        # <<< NEW
+            scale = np.max(np.abs(combined)) + 1e-6                      # <<< NEW
+            combined = combined / scale                                  # <<< NEW
+            return combined.astype(np.float32)                           # <<< NEW
+
+        # ------------ CASE 2: pred_len > 0 (USE CHRONOS) ---------------
+        # cache only in Chronos mode
+        if timestamp in state["feature_cache"]:                          # <<< CHANGED
+            return state["feature_cache"][timestamp]                     # <<< CHANGED
+
         # 3. Run Chronos (Standard Public API)
-        # We pass a list of tensors.
         with torch.inference_mode():
             # context shape: [1, seq_len]
             ctx_tensor = torch.tensor(price_path, device=device).float()
-            
-            # predict_quantiles returns (forecast, quantiles)
-            # We just want the median (0.5) forecast
-            forecast_tensor = state["pipe"].predict_quantiles(
-                context=ctx_tensor.unsqueeze(0), 
+
+            # BaseChronosPipeline.predict_quantiles returns (samples, quantiles)
+            _, quantiles = state["pipe"].predict_quantiles(              # <<< CHANGED
+                context=[ctx_tensor],                                    # <<< CHANGED
                 prediction_length=pred_len,
                 quantile_levels=[0.5],
-                limit_prediction_length=False 
-            )[0] # [1, pred_len, 1]
-            
-            # Extract the median forecast
-            forecast_values = forecast_tensor[0, :, 0].cpu().numpy() # [pred_len]
-            
+            )
+            # quantiles shape: (batch, pred_len)
+            forecast_values = quantiles[0, :pred_len].detach().cpu().numpy()  # <<< CHANGED
+
         # 4. Normalize & Combine
-        # We normalize the Combined vector so the MLP trains easily.
-        # We zero-center based on the *history start*.
         combined = np.concatenate([price_path, forecast_values])
-        
-        # Simple MinMax/Standard scaling relative to the window itself
-        # (This makes the pattern invariant to absolute price level)
-        combined = combined - combined[0] # Start at 0
+
+        combined = combined - combined[0]
         scale = np.max(np.abs(combined)) + 1e-6
         combined = combined / scale
-        
-        # 5. Cache and Return
+
+        # 5. Cache and Return (only in Chronos mode)
         state["feature_cache"][timestamp] = combined.astype(np.float32)
-        return combined
+        return state["feature_cache"][timestamp]
+
 
     # ---- Main Fit/Predict ----
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
         state["step"] += 1
         current_time = row_t.name # Timestamp index
-        
-        # 1. Initialize Pipeline (Once)
-        if state["pipe"] is None:
-            print(f"[Chronos-MLP] Loading {model_id} on {device}...")
-            state["pipe"] = BaseChronosPipeline.from_pretrained(
-                model_id,
-                device_map=device,
-                torch_dtype=torch.float32
-            )
-            # Input dim = History + Forecast
-            state["mlp"] = AugmentedMLP(input_dim=seq_len + pred_len).to(device)
+
+        # 1. Initialize models (Once)
+        if state["mlp"] is None:                                        # <<< CHANGED (check mlp, not pipe)
+            print(f"[Chronos-MLP] Initializing on {device} "
+                  f"| pred_len={pred_len} (0 => no Chronos)")           # <<< NEW
+
+            # Only load Chronos if pred_len > 0
+            if pred_len > 0:                                            # <<< NEW
+                print(f"[Chronos-MLP] Loading {model_id}...")           # <<< NEW
+                state["pipe"] = BaseChronosPipeline.from_pretrained(    # <<< NEW
+                    model_id,
+                    device_map=device,
+                    torch_dtype=torch.float32,
+                )
+
+            input_dim = seq_len + (pred_len if pred_len > 0 else 0)     # <<< NEW
+            state["mlp"] = AugmentedMLP(input_dim=input_dim).to(device)
             state["optimizer"] = torch.optim.AdamW(state["mlp"].parameters(), lr=lr)
             state["loss_fn"] = nn.BCEWithLogitsLoss()
 
         # 2. Retrain MLP (Periodically)
         if state["step"] % retrain_every == 0 or state["step"] == 1:
-            # A. Build Training Set
-            # We iterate backwards from current time to build a training batch
             X_list = []
             y_list = []
-            
-            # Get feature/target arrays
+
             feats = est[feature_col].values
             targs = est[target_col].values
             times = est.index
-            
-            # Limit training to recent history to keep it fast
-            # (Generating forecasts is slower than just loading numbers)
-            indices = range(len(feats) - seq_len, seq_len, -1) # Backwards
+
+            if len(feats) <= seq_len:
+                return np.nan
+
+            # Backwards indices: last index down to seq_len
+            indices = range(len(feats) - 1, seq_len - 1, -1)
             count = 0
-            
+
             for i in indices:
-                if count >= train_window_limit: break
-                
-                # Window: [i - seq_len : i]
-                # Target: label at time i
-                w = feats[i-seq_len : i]
+                if count >= train_window_limit:
+                    break
+
+                w = feats[i - seq_len : i]
+                if len(w) < seq_len:
+                    continue
+
                 ts = times[i]
                 y = targs[i]
-                
-                # Generate Features (Uses Cache if available)
+
                 x_vec = get_augmented_features(w, ts)
-                
+
                 X_list.append(x_vec)
                 y_list.append(y)
                 count += 1
-            
+
             # B. Train MLP
             if len(X_list) > 10:
                 X_train = torch.tensor(np.stack(X_list)).float().to(device)
                 y_train = torch.tensor(np.array(y_list)).float().unsqueeze(1).to(device)
-                
+
                 ds = TensorDataset(X_train, y_train)
                 loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-                
+
                 state["mlp"].train()
                 losses = []
                 for _ in range(epochs):
@@ -1152,21 +1250,18 @@ def make_chronos_forecast_mlp_cls_fn(
                         loss.backward()
                         state["optimizer"].step()
                         losses.append(loss.item())
-                
+                # optional: print loss
                 # print(f"[Step {state['step']}] MLP Loss: {np.mean(losses):.4f}")
 
         # 3. Inference (Current Step)
-        # Get window
         cur_series = est[feature_col].to_numpy()
-        if len(cur_series) < seq_len: return np.nan
-        
+        if len(cur_series) < seq_len:
+            return np.nan
+
         window = cur_series[-seq_len:]
-        
-        # Generate features (Forecast)
-        # We use current_time as key
+
         x_vec = get_augmented_features(window, current_time)
-        
-        # MLP Prediction
+
         state["mlp"].eval()
         with torch.inference_mode():
             x_tensor = torch.tensor(x_vec).float().unsqueeze(0).to(device)
