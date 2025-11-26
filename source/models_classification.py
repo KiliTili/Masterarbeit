@@ -6,7 +6,19 @@ from sklearn.linear_model import LogisticRegression
 import os
 sys.path.insert(0, os.path.abspath('../'))
 from source.modelling_utils import expanding_oos_tabular_cls
+import random, numpy as np, torch
 
+def set_global_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_global_seed(42)
 
 def make_logit_multifeature_lag_fit_predict_fn(
     base_cols: list[str] = ["SXXT", "SPX", "NKY", "SPTR", "EUR003M",

@@ -17,6 +17,19 @@ sys.path.insert(0, os.path.abspath('../'))
 
 from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular
 import torch
+import random, numpy as np, torch
+
+def set_global_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_global_seed(42)
 # ================================================================
 # 1. OLS & RANKING (1-step tabular)
 # ================================================================

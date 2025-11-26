@@ -3,7 +3,19 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from math import inf
 from sklearn.linear_model import LogisticRegression
+import random, numpy as np, torch
 
+def set_global_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_global_seed(42)
 def plot_oos_cls(
     y_true,
     y_prob,
