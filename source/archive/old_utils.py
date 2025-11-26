@@ -107,12 +107,11 @@ def baseline_forecast(
 
     if mode == "mean":
         b = np.empty_like(y_true)
-        b[0] = 0 # Kein Forecast für den allerersten Punkt möglich ohne Historie
+        b[0] = np.nan # Kein Forecast für den allerersten Punkt möglich ohne Historie
         
         # Für t=1 bis Ende: Mean von 0 bis t-1
         # y_true[:i] geht von 0 bis i-1. Das ist korrekt für den Forecast an Stelle i.
         b[1:] = [y_true[:i].mean() for i in range(1, len(y_true))]
-        return b
     elif mode == "rw":
         # https://agorism.dev/book/finance/time-series/James%20Douglas%20Hamilton%20-%20Time%20Series%20Analysis%20%281994%2C%20Princeton%20University%20Press%29%20-%20libgen.lc.pdf
         # random walk: forecast y_t by y_{t-1}
@@ -243,7 +242,34 @@ def evaluate_oos(
 
     # Return both the point estimate and the stats dictionary
     return r2_oos, stats
+# def evaluate_oos(y_true, y_pred, model_name="Model", device="cpu", quiet=False, mode: str = "mean",):
+#     """
+#     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
+#     using the expanding mean as the benchmark forecast.
+#     """
+#     y_true = np.asarray(y_true, float)
+#     y_pred = np.asarray(y_pred, float)
 
+#     m = ~np.isnan(y_true) & ~np.isnan(y_pred)
+#     y_true, y_pred = y_true[m], y_pred[m]
+
+#     if len(y_true) == 0:
+#         if not quiet:
+#             print(f"[{model_name}] No valid predictions (all NaN).")
+#         return np.nan
+
+#     mse = mean_squared_error(y_true, y_pred)
+#     rmse = float(np.sqrt(mse))
+
+#     mean_forecast = baseline_forecast(y_true, mode=mode)
+#     denom = np.sum((y_true - mean_forecast) ** 2)
+#     r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom) if denom > 0 else np.nan
+
+#     if not quiet:
+#         print(f"[{model_name}] Device={device} | Valid months={len(y_true)} | "
+#               f"MSE={mse:.6f} | RMSE={rmse:.6f} | R²_OS={r2_oos:.4f}")
+
+#     return r2_oos
 def evaluate_oos_classification(
     y_true,
     y_pred,
@@ -481,109 +507,109 @@ def expanding_oos_tabular(
     return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates)
 
 
-# def expanding_oos_univariate(
-#     y: pd.Series,
-#     start_oos: str = "1965-01-01",
-#     prediction_length: int = 1,
-#     min_history_months: int = 240,
-#     ct_cutoff: bool = False,
-#     quiet: bool = False,
-#     model_name: str = "TS-Model",
-#     forecast_multi_step_fn: Callable[[pd.Series, pd.Timestamp, int], np.ndarray] | None = None,
-#     mode = "mean",
-# ) -> Tuple[
-#     Dict[int, float],
-#     Dict[int, np.ndarray],
-#     Dict[int, np.ndarray],
-#     Dict[int, pd.DatetimeIndex],
-# ]:
-#     """
-#     Generic expanding-window univariate OOS driver with arbitrary prediction_length.
+def expanding_oos_univariate(
+    y: pd.Series,
+    start_oos: str = "1965-01-01",
+    prediction_length: int = 1,
+    min_history_months: int = 240,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str = "TS-Model",
+    forecast_multi_step_fn: Callable[[pd.Series, pd.Timestamp, int], np.ndarray] | None = None,
+    mode = "mean",
+) -> Tuple[
+    Dict[int, float],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    Dict[int, pd.DatetimeIndex],
+]:
+    """
+    Generic expanding-window univariate OOS driver with arbitrary prediction_length.
 
-#     forecast_multi_step_fn(y_hist, origin_date, prediction_length) -> array of shape (H,)
+    forecast_multi_step_fn(y_hist, origin_date, prediction_length) -> array of shape (H,)
 
-#     Returns dicts keyed by horizon h = 1..H:
-#       - r2[h]       : scalar R²_OS for horizon h
-#       - trues[h]    : np.array of true values at horizon h
-#       - preds[h]    : np.array of predictions at horizon h
-#       - dates[h]    : DatetimeIndex of evaluation dates for horizon h
-#     """
-#     if forecast_multi_step_fn is None:
-#         raise ValueError("forecast_multi_step_fn must be provided.")
-#     if prediction_length <= 0:
-#         raise ValueError("prediction_length must be >= 1")
+    Returns dicts keyed by horizon h = 1..H:
+      - r2[h]       : scalar R²_OS for horizon h
+      - trues[h]    : np.array of true values at horizon h
+      - preds[h]    : np.array of predictions at horizon h
+      - dates[h]    : DatetimeIndex of evaluation dates for horizon h
+    """
+    if forecast_multi_step_fn is None:
+        raise ValueError("forecast_multi_step_fn must be provided.")
+    if prediction_length <= 0:
+        raise ValueError("prediction_length must be >= 1")
 
-#     y = y.astype("float32").dropna()
-#     if y.empty:
-#         raise ValueError("Target series is empty after cleaning.")
+    y = y.astype("float32").dropna()
+    if y.empty:
+        raise ValueError("Target series is empty after cleaning.")
 
-#     # enforce min history before first origin
-#     start_ts = expand_start_with_min_history(
-#         y.index, start_oos, min_history_months=min_history_months
-#     )
+    # enforce min history before first origin
+    start_ts = expand_start_with_min_history(
+        y.index, start_oos, min_history_months=min_history_months
+    )
 
-#     # also need enough future data to evaluate all horizons
-#     last_valid_origin = y.index[-prediction_length]  # index for t such that t+H-1 exists
-#     test_idx = y.index[(y.index >= start_ts) & (y.index <= last_valid_origin)]
+    # also need enough future data to evaluate all horizons
+    last_valid_origin = y.index[-prediction_length]  # index for t such that t+H-1 exists
+    test_idx = y.index[(y.index >= start_ts) & (y.index <= last_valid_origin)]
 
-#     if not quiet:
-#         print(f"[{model_name}] prediction_length={prediction_length}, "
-#               f"origins={len(test_idx)}, first_origin={test_idx[0].date()}, "
-#               f"last_origin={test_idx[-1].date()}")
+    if not quiet:
+        print(f"[{model_name}] prediction_length={prediction_length}, "
+              f"origins={len(test_idx)}, first_origin={test_idx[0].date()}, "
+              f"last_origin={test_idx[-1].date()}")
 
-#     preds = {h: [] for h in range(1, prediction_length+1)}
-#     trues = {h: [] for h in range(1, prediction_length+1)}
-#     dates = {h: [] for h in range(1, prediction_length+1)}
+    preds = {h: [] for h in range(1, prediction_length+1)}
+    trues = {h: [] for h in range(1, prediction_length+1)}
+    dates = {h: [] for h in range(1, prediction_length+1)}
 
-#     for date_t in test_idx:
-#         print(date_t)
-#         pos = y.index.get_loc(date_t)
-#         if isinstance(pos, slice):
-#             pos = pos.start
+    for date_t in test_idx:
+        print(date_t)
+        pos = y.index.get_loc(date_t)
+        if isinstance(pos, slice):
+            pos = pos.start
 
-#         y_hist = y.iloc[:pos]
-#         if y_hist.isna().any():
-#             continue
+        y_hist = y.iloc[:pos]
+        if y_hist.isna().any():
+            continue
 
-#         y_hat_vec = forecast_multi_step_fn(y_hist, date_t, prediction_length)
-#         y_hat_vec = np.asarray(y_hat_vec, float).reshape(-1)
-#         if len(y_hat_vec) < prediction_length:
-#             continue
+        y_hat_vec = forecast_multi_step_fn(y_hist, date_t, prediction_length)
+        y_hat_vec = np.asarray(y_hat_vec, float).reshape(-1)
+        if len(y_hat_vec) < prediction_length:
+            continue
 
-#         for h in range(1, prediction_length + 1):
-#             target_pos = pos + (h - 1)
-#             y_true = float(y.iloc[target_pos])
-#             y_hat = float(y_hat_vec[h-1])
-#             if np.isnan(y_true) or np.isnan(y_hat):
-#                 continue
-#             if ct_cutoff:
-#                 y_hat = float(ct_truncate(y_hat))
-#             trues[h].append(y_true)
-#             preds[h].append(y_hat)
-#             dates[h].append(y.index[target_pos])
+        for h in range(1, prediction_length + 1):
+            target_pos = pos + (h - 1)
+            y_true = float(y.iloc[target_pos])
+            y_hat = float(y_hat_vec[h-1])
+            if np.isnan(y_true) or np.isnan(y_hat):
+                continue
+            if ct_cutoff:
+                y_hat = float(ct_truncate(y_hat))
+            trues[h].append(y_true)
+            preds[h].append(y_hat)
+            dates[h].append(y.index[target_pos])
 
-#     # convert to arrays/index & compute R² per horizon
-#     r2 = {}
-#     for h in range(1, prediction_length+1):
-#         trues[h] = np.asarray(trues[h], float)
-#         preds[h] = np.asarray(preds[h], float)
-#         dates[h] = pd.DatetimeIndex(dates[h])
+    # convert to arrays/index & compute R² per horizon
+    r2 = {}
+    for h in range(1, prediction_length+1):
+        trues[h] = np.asarray(trues[h], float)
+        preds[h] = np.asarray(preds[h], float)
+        dates[h] = pd.DatetimeIndex(dates[h])
 
-#         if len(trues[h]) == 0:
-#             r2[h] = np.nan
-#             if not quiet:
-#                 print(f"[{model_name}] horizon h={h}: no valid predictions.")
-#         else:
-#             r2[h] = evaluate_oos(
-#                 trues[h],
-#                 preds[h],
-#                 model_name=f"{model_name} (h={h})",
-#                 device="cpu",
-#                 quiet=quiet,
-#                 mode = mode
-#             )
+        if len(trues[h]) == 0:
+            r2[h] = np.nan
+            if not quiet:
+                print(f"[{model_name}] horizon h={h}: no valid predictions.")
+        else:
+            r2[h] = evaluate_oos(
+                trues[h],
+                preds[h],
+                model_name=f"{model_name} (h={h})",
+                device="cpu",
+                quiet=quiet,
+                mode = mode
+            )
 
-#     return r2, trues, preds, dates
+    return r2, trues, preds, dates
 
 
 def expanding_oos_tabular_cls(

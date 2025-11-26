@@ -799,6 +799,268 @@ def make_mlp_lag_cls_fit_predict_fn(
     return fit_predict
 
 
+class LSTMCls(nn.Module):
+    def __init__(self, n_feat, hidden=64, num_layers=1, bidir=False, dropout=0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=n_feat, hidden_size=hidden, num_layers=num_layers,
+            batch_first=True, bidirectional=bidir,
+            dropout=(dropout if num_layers > 1 else 0.0)
+        )
+        d = hidden * (2 if bidir else 1)
+        self.head = nn.Linear(d, 1)
+    def forward(self, x):  # [B, L, F]
+        h, _ = self.lstm(x)
+        z = h[:, -1, :]
+        return self.head(z).squeeze(-1)  # logits
+
+def make_lstm_seq_cls_fit_predict_fn(
+    feature_cols,
+    target_col: str = "state",
+    seq_len: int = 24,
+    epochs: int = 5,
+    batch_size: int = 128,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-2,
+    retrain_every: int = 25,
+    hidden: int = 64,
+    num_layers: int = 1,
+    bidir: bool = False,
+    dropout: float = 0.0,
+    scale: bool = True,
+    class_weight: bool = False,
+    return_proba: bool = False,
+    print_loss: bool = True,
+):
+    import numpy as np, pandas as pd, torch, torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from sklearn.preprocessing import StandardScaler
+
+    feature_cols = list(feature_cols)
+    n_feat = len(feature_cols)
+
+    if torch.backends.mps.is_available(): device = torch.device("mps")
+    elif torch.cuda.is_available(): device = torch.device("cuda")
+    else: device = torch.device("cpu")
+    model, scaler, step = None, None, 0
+
+    def make_windows(X_df, y_ser):
+        X = X_df.to_numpy("float32")
+        y = y_ser.to_numpy("float32")
+        T = len(X)
+        if T <= seq_len: return None, None
+        Xs, ys = [], []
+        for t in range(seq_len, T):
+            Xs.append(X[t-seq_len:t, :])
+            ys.append(y[t])
+        return np.stack(Xs).astype("float32"), np.asarray(ys, "float32")
+
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        nonlocal model, scaler, step
+        step += 1
+        df = est.copy()
+        if any(c not in df.columns for c in feature_cols+[target_col]): return np.nan
+        if len(df) <= seq_len or df[target_col].nunique() < 2: return np.nan
+
+        X_df = df[feature_cols].astype("float32")
+        y_ser = df[target_col].astype("float32")
+
+        # scale history
+        if scale:
+            scaler = StandardScaler().fit(X_df.values)
+            Xn = scaler.transform(X_df.values).astype("float32")
+            Xn_df = pd.DataFrame(Xn, index=X_df.index, columns=X_df.columns)
+        else:
+            Xn_df = X_df
+
+        # (re)train
+        if (model is None) or (step % retrain_every == 0):
+            X_train, y_train = make_windows(Xn_df, y_ser)
+            if X_train is None or len(X_train) < 10: return np.nan
+
+            ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+            model = LSTMCls(n_feat=n_feat, hidden=hidden, num_layers=num_layers,
+                            bidir=bidir, dropout=dropout).to(device)
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+            if class_weight:
+                pos = max(1.0, float((y_train == 1).sum()))
+                neg = max(1.0, float((y_train == 0).sum()))
+                w = torch.tensor([neg / pos], dtype=torch.float32, device=device)  # pos_weight
+                crit = nn.BCEWithLogitsLoss(pos_weight=w)
+            else:
+                crit = nn.BCEWithLogitsLoss()
+
+            model.train()
+            for ep in range(epochs):
+                run, nb = 0.0, 0
+                for xb, yb in loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    logit = model(xb)
+                    loss = crit(logit, yb)
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+                    run += loss.item(); nb += 1
+                if print_loss:
+                    print(f"[LSTMCls retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")
+
+        # context window for t from last seq_len rows (past only)
+        X_hist = df[feature_cols].to_numpy("float32")
+        if len(X_hist) < seq_len: return np.nan
+        if scale and scaler is not None:
+            X_hist = scaler.transform(X_hist).astype("float32")
+        ctx = X_hist[-seq_len:, :].reshape(1, seq_len, n_feat)
+        xb = torch.from_numpy(ctx).to(device)
+
+        model.eval()
+        with torch.inference_mode():
+            p1 = torch.sigmoid(model(xb)).item()
+
+        return float(p1) if return_proba else int(p1 >= 0.5)
+
+    return fit_predict
+import math, torch, torch.nn as nn
+
+class PosEnc(nn.Module):
+    def __init__(self, d_model=128, max_len=4096):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe, persistent=False)
+    def forward(self, x):
+        L = x.size(1)
+        return x + self.pe[:L].unsqueeze(0)
+
+class TransformerCls(nn.Module):
+    def __init__(self, n_feat, d_model=128, nhead=4, num_layers=2, dim_ff=256, dropout=0.1):
+        super().__init__()
+        self.inp = nn.Linear(n_feat, d_model)
+        self.pos = PosEnc(d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True, activation="gelu", norm_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, 1)
+    def forward(self, x):   # [B, L, F]
+        h = self.inp(x)
+        h = self.pos(h)
+        h = self.enc(h)
+        z = h[:, -1, :]
+        return self.head(z).squeeze(-1)  # logits
+
+def make_transformer_seq_cls_fit_predict_fn(
+    feature_cols,
+    target_col: str = "state",
+    seq_len: int = 24,
+    epochs: int = 5,
+    batch_size: int = 128,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-2,
+    retrain_every: int = 25,
+    d_model: int = 128,
+    nhead: int = 4,
+    num_layers: int = 2,
+    dim_feedforward: int = 256,
+    dropout: float = 0.1,
+    scale: bool = True,
+    class_weight: bool = False,
+    return_proba: bool = False,
+    print_loss: bool = True,
+):
+    import numpy as np, pandas as pd, torch, torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from sklearn.preprocessing import StandardScaler
+
+    feature_cols = list(feature_cols)
+    n_feat = len(feature_cols)
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+
+    model, scaler, step = None, None, 0
+
+    def make_windows(X_df, y_ser):
+        X = X_df.to_numpy("float32")
+        y = y_ser.to_numpy("float32")
+        T = len(X)
+        if T <= seq_len: return None, None
+        Xs, ys = [], []
+        for t in range(seq_len, T):
+            Xs.append(X[t-seq_len:t, :])
+            ys.append(y[t])
+        return np.stack(Xs).astype("float32"), np.asarray(ys, "float32")
+
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        nonlocal model, scaler, step
+        step += 1
+        df = est.copy()
+        if any(c not in df.columns for c in feature_cols+[target_col]): return np.nan
+        if len(df) <= seq_len or df[target_col].nunique() < 2: return np.nan
+
+        X_df = df[feature_cols].astype("float32")
+        y_ser = df[target_col].astype("float32")
+
+        if scale:
+            scaler = StandardScaler().fit(X_df.values)
+            Xn = scaler.transform(X_df.values).astype("float32")
+            Xn_df = pd.DataFrame(Xn, index=X_df.index, columns=X_df.columns)
+        else:
+            Xn_df = X_df
+
+        if (model is None) or (step % retrain_every == 0):
+            X_train, y_train = make_windows(Xn_df, y_ser)
+            if X_train is None or len(X_train) < 10: return np.nan
+
+            ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+            model = TransformerCls(n_feat=n_feat, d_model=d_model, nhead=nhead,
+                                   num_layers=num_layers, dim_ff=dim_feedforward,
+                                   dropout=dropout).to(device)
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+            if class_weight:
+                pos = max(1.0, float((y_train == 1).sum()))
+                neg = max(1.0, float((y_train == 0).sum()))
+                w = torch.tensor([neg / pos], dtype=torch.float32, device=device)
+                crit = nn.BCEWithLogitsLoss(pos_weight=w)
+            else:
+                crit = nn.BCEWithLogitsLoss()
+
+            model.train()
+            for ep in range(epochs):
+                run, nb = 0.0, 0
+                for xb, yb in loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    logit = model(xb)
+                    loss = crit(logit, yb)
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+                    run += loss.item(); nb += 1
+                if print_loss:
+                    print(f"[TransformerCls retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")
+
+        # one-step-ahead prediction: last seq_len rows of history (no look-ahead)
+        X_hist = df[feature_cols].to_numpy("float32")
+        if len(X_hist) < seq_len: return np.nan
+        if scale and scaler is not None:
+            X_hist = scaler.transform(X_hist).astype("float32")
+        ctx = X_hist[-seq_len:, :].reshape(1, seq_len, n_feat)
+        xb = torch.from_numpy(ctx).to(device)
+
+        model.eval()
+        with torch.inference_mode():
+            p1 = torch.sigmoid(model(xb)).item()
+        return float(p1) if return_proba else int(p1 >= 0.5)
+
+    return fit_predict
+
 
 
 import numpy as np
@@ -987,7 +1249,68 @@ def make_chronos_t5_cls_fit_predict_fn(
         return float(prob_bull) if return_proba else int(prob_bull >= 0.5)
 
     return fit_predict
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
+from chronos import BaseChronosPipeline
+from tqdm.auto import tqdm
 
+# --- 1. Custom Classifier Wrapper ---
+# This wraps the Bolt backbone so we can train a head on top of it
+class ChronosBoltClassifier(nn.Module):
+    def __init__(self, backbone, d_model=512): # Bolt Small usually has d_model=512 (Base=768)
+        super().__init__()
+        self.backbone = backbone
+        # We only need the encoder part of Bolt for classification
+        self.encoder = backbone.encoder if hasattr(backbone, "encoder") else backbone.model.encoder
+        
+        # Simple Classification Head
+        self.head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(d_model, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1) # Output 1 logit (Binary)
+        )
+
+    def forward(self, input_ids, attention_mask):
+        # 1. Pass through Bolt Encoder
+        # Bolt/T5 encoders return a specific object, we want 'last_hidden_state'
+        encoder_outputs = self.encoder(
+            input_ids=input_ids, 
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        last_hidden_state = encoder_outputs.last_hidden_state # [Batch, Seq_Len, d_model]
+        
+        # 2. Mean Pooling (Average all tokens to get one vector per window)
+        # Mask out padding tokens so they don't drag down the average
+        mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        sum_embeddings = torch.sum(last_hidden_state * mask_expanded, 1)
+        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+        pooled = sum_embeddings / sum_mask
+        
+        # 3. Classify
+        logits = self.head(pooled)
+        return logits
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
+from chronos import BaseChronosPipeline
+
+# ==========================================
+# 1. SIMPLE MLP CLASSIFIER
+# ==========================================
 class AugmentedMLP(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -1176,3 +1499,11 @@ def make_chronos_forecast_mlp_cls_fn(
         return float(prob) if return_proba else int(prob >= 0.5)
 
     return fit_predict
+
+
+
+
+# Todo chronos and timesfm with classification head
+#FT‑Transforme
+#Lightwood
+#xtab

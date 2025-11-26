@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath('../'))
 from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular, expanding_oos_univariate,plot_oos
 import torch
 # ================================================================
-# 3. OLS & RANKING (1-step tabular)
+# 1. OLS & RANKING (1-step tabular)
 # ================================================================
 
 def make_lagged_features(df: pd.DataFrame, vars_, lag: int) -> pd.DataFrame:
@@ -100,7 +100,7 @@ def rank_monthly_predictors(
     results = []
     for v in monthly_vars:
         try:
-            r2, _, _, _ = ols_oos(
+            r2,_, _, _, _ = ols_oos(
                 data,
                 variables=(v,),
                 target_col="equity_premium",
@@ -132,7 +132,7 @@ def rank_monthly_predictors(
 
 
 # ================================================================
-# 4. TREE ENSEMBLE (XGB / GBRT, 1-step)
+# 2. TREE ENSEMBLE (XGB / GBRT, 1-step)
 # ================================================================
 
 def tree_ensemble_oos(
@@ -240,12 +240,185 @@ def tree_ensemble_oos(
         mode = mode
     )
 
+from typing import Dict, Tuple
+import numpy as np
+import pandas as pd
 
-# ================================================================
-# 5. DEEP TS MODELS – CHRONOS, TIMESFM, FLOWSTATE, MOIRAI2
-# ================================================================
 
-# 5.1 Chronos
+def autoarima_oos(
+    data: pd.DataFrame,
+    target_col: str = "equity_premium",
+    start_oos: str = "1965-01-01",
+    freq: str = "MS",                # user-facing freq, but we will align to MS internally
+    prediction_length: int = 1,      # this implementation only supports 1-step
+    min_history_months: int = 60,
+    seasonal: bool | None = None,
+    m: int | None = None,
+    ct_cutoff: bool = True,
+    quiet: bool = False,
+    model_name: str = "AutoARIMA",
+    auto_arima_kwargs: dict | None = None,
+    order_search_every: int | None = None,    # re-search orders every k steps
+    refit_each_step: bool = True,
+    mode: str = "mean",
+) -> Tuple[float, Dict, np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """
+    Expanding-window 1-step-ahead OOS for pmdarima.auto_arima using
+    the generic expanding_oos_tabular driver.
+
+    IMPORTANT:
+    - We force the target series to month-start ("MS") internally so that
+      AutoARIMA works on a regular monthly grid without shifting your
+      original month-start Convention.
+    - This does NOT affect your linear regression / tree / TabPFN models.
+    """
+    # --- local imports, so NameError cannot happen ---
+    import warnings
+    from pmdarima import auto_arima, ARIMA
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+    if prediction_length != 1:
+        raise ValueError("This autoarima_oos implementation supports only prediction_length = 1.")
+
+    if auto_arima_kwargs is None:
+        auto_arima_kwargs = {}
+
+    # ------------------------------------------------------------------
+    # 1. Prepare target series at MONTH-START frequency
+    # ------------------------------------------------------------------
+    df = ensure_datetime_index(data)
+
+    # We FORCE month-start alignment here, regardless of `freq` passed in,
+    # so that AutoARIMA sees the same month-start grid as the rest of your data.
+    df_ms = align_monthly(df[[target_col]], freq=freq, col=target_col)
+    y = df_ms[target_col].astype("float32")
+
+    # ------------------------------------------------------------------
+    # 2. Seasonal settings (still based on user freq, but everything is monthly)
+    # ------------------------------------------------------------------
+    freq_u = freq.upper()
+    # If not specified, default to seasonal for monthly/quarterly
+    if seasonal is None:
+        seasonal = freq_u in {"M", "MS", "ME", "Q", "QS"}
+
+    # Default seasonal period length
+    if m is None:
+        if freq_u in {"M", "MS", "ME"}:
+            m = 12
+        else:
+            m = 1
+
+    # Keep state of best orders across time
+    state = {"order": None, "seasonal_order": None, "step": 0}
+
+    # ------------------------------------------------------------------
+    # 3. Internal: forecast one step given y_hist and date_t
+    # ------------------------------------------------------------------
+    def forecast_one_step(y_hist: pd.Series, date_t: pd.Timestamp) -> float | None:
+        """
+        y_hist: past values up to t-1 on a month-start grid
+        date_t: current origin date t (month-start timestamp)
+        """
+        state["step"] += 1
+        y_hist = y_hist.dropna()
+        if len(y_hist) < min_history_months:
+            return None
+
+        # Decide if we need to (re)search the best (p,d,q)(P,D,Q,m)
+        need_search = (
+            state["order"] is None
+            or state["seasonal_order"] is None
+            or (order_search_every is not None
+                and state["step"] % order_search_every == 1)
+        )
+
+        if need_search:
+            if not quiet:
+                print(f"[AutoARIMA] Searching best order at {date_t.date()}...")
+            model = auto_arima(
+                y_hist.values,
+                seasonal=seasonal,
+                m=m,
+                error_action="ignore",
+                suppress_warnings=True,
+                stepwise=True,
+                **auto_arima_kwargs,
+            )
+            state["order"] = model.order
+            state["seasonal_order"] = model.seasonal_order
+            if not quiet:
+                print(f"  best order={model.order}, seasonal_order={model.seasonal_order}")
+        else:
+            # IMPORTANT: do NOT pass seasonal/m here to avoid the FutureWarning
+            model = ARIMA(
+                order=state["order"],
+                seasonal_order=state["seasonal_order"],
+            )
+
+        # Refit on current history if requested
+        if refit_each_step:
+            try:
+                with warnings.catch_warnings():
+                    if quiet:
+                        warnings.simplefilter("ignore")
+                        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                    model = model.fit(y_hist.values)
+            except Exception as e:
+                if not quiet:
+                    print(f"[AutoARIMA] fit failed at {date_t}: {e}")
+                return None
+
+        # 1-step forecast
+        try:
+            with warnings.catch_warnings():
+                if quiet:
+                    warnings.simplefilter("ignore")
+                fc = model.predict(n_periods=1)
+        except Exception as e:
+            if not quiet:
+                print(f"[AutoARIMA] predict failed at {date_t}: {e}")
+            return None
+
+        return float(fc[0])
+
+    # ------------------------------------------------------------------
+    # 4. Wrap this into model_fit_predict_fn for expanding_oos_tabular
+    # ------------------------------------------------------------------
+    def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        """
+        est : past data (month-start-aligned DataFrame) up to t-1
+        row_t : row at time t (we only need its timestamp)
+        """
+        date_t = row_t.name
+        # Use the global aligned series 'y' (month-start) to build history
+        # up to but not including date_t.
+        y_hist = y.loc[:date_t].iloc[:-1]
+        if y_hist.empty:
+            return None
+        return forecast_one_step(y_hist, date_t)
+
+    # ------------------------------------------------------------------
+    # 5. Call the generic expanding OOS driver
+    # ------------------------------------------------------------------
+    r2, stats, trues, preds, dates = expanding_oos_tabular(
+        df_ms,                          # month-start target series
+        target_col=target_col,
+        feature_cols=[],                # no explicit tabular features; model uses y_hist internally
+        start_oos=start_oos,
+        start_date=df_ms.index.min().strftime("%Y-%m-%d"),
+        min_train=min_history_months,
+        min_history_months=min_history_months,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name=model_name,
+        model_fit_predict_fn=model_fit_predict_fn,
+        mode=mode,
+    )
+
+    return r2, stats, trues, preds, dates
+# ================================================================
+# 5. DEEP TS MODELS – CHRONOS
+# ================================================================
 from chronos import BaseChronosPipeline
 
 def chronos_oos(
@@ -254,12 +427,22 @@ def chronos_oos(
     start_oos="1965-01-01",
     freq="MS",
     prediction_length: int = 1,
+    ctx_min: int = 24,
     ct_cutoff=True,
     quiet=False,
     mode = "mean"
 ):
+    """
+    1-step-ahead Chronos-Bolt OOS evaluation using expanding_oos_tabular.
+
+    For true multi-step forecasts, keep a separate function using expanding_oos_univariate.
+    """
+    if prediction_length != 1:
+        raise ValueError("This chronos_oos version supports only prediction_length=1.")
+
     df = ensure_datetime_index(data)
-    y = align_monthly(df[[target_col]], freq, col=target_col)[target_col]
+    y_df = align_monthly(df[[target_col]], freq=freq, col=target_col)
+    y = y_df[target_col].astype("float32")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = BaseChronosPipeline.from_pretrained(
@@ -268,188 +451,41 @@ def chronos_oos(
         torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     )
 
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+    def forecast_one_step(y_hist: pd.Series, date_t: pd.Timestamp) -> float | None:
         ctx = y_hist.to_numpy(dtype="float32")
-        if len(ctx) < 24:
-            return np.full(H, np.nan, dtype="float32")
+        if len(ctx) < ctx_min:
+            return None
         with torch.inference_mode():
             _, mean_pred = pipe.predict_quantiles(
                 context=[torch.tensor(ctx, device=device)],
-                prediction_length=H,
+                prediction_length=1,
                 quantile_levels=[0.5],
             )
-        # mean_pred shape: (batch, H)
-        return np.asarray(mean_pred[0, :H], dtype="float32")
+        return float(mean_pred[0, 0])
 
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
+    def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        date_t = row_t.name
+        y_hist = y.loc[:date_t].iloc[:-1]
+        return forecast_one_step(y_hist, date_t)
+
+    r2, stats, trues, preds, dates = expanding_oos_tabular(
+        y_df,
+        target_col=target_col,
+        feature_cols=[],  # no exogenous predictors; Chronos sees the sequence in y_hist
         start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=240,   # 20 years
+        start_date=y_df.index.min().strftime("%Y-%m-%d"),
+        min_train=ctx_min,
+        min_history_months=ctx_min,
         ct_cutoff=ct_cutoff,
         quiet=quiet,
-        model_name="Chronos-Bolt",
-        forecast_multi_step_fn=forecast_multi_step,
-        mode = mode
+        model_name="Chronos-Bolt (1-step)",
+        model_fit_predict_fn=model_fit_predict_fn,
+        mode=mode,
     )
-    return r2, trues, preds, dates
-
-
-# 5.2 TimesFM
-import timesfm
-
-def timesfm_oos(
-    data: pd.DataFrame,
-    target_col="equity_premium",
-    start_oos="1965-01-01",
-    freq="MS",
-    prediction_length: int = 1,
-    min_context=120,
-    max_context=512,
-    ct_cutoff=True,
-    quiet=False,
-    mode = "mean"
-):
-    torch.set_float32_matmul_precision("high")
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    if not quiet:
-        print(f"[TimesFM] Using device hint: {device}")
-
-    df = ensure_datetime_index(data)
-    y = align_monthly(df[[target_col]], freq, col=target_col)[target_col].astype("float32")
-    if len(y) == 0:
-        raise ValueError("No target data after cleaning.")
-
-    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
-    cfg = timesfm.ForecastConfig(
-        max_context=max_context,
-        max_horizon=max(prediction_length, 128),
-        normalize_inputs=True,
-        use_continuous_quantile_head=True,
-        force_flip_invariance=True,
-        infer_is_positive=False,
-        fix_quantile_crossing=True,
-    )
-    model.compile(cfg)
-
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
-        context = y_hist.to_numpy(dtype="float32")
-        if len(context) < min_context:
-            return np.full(H, np.nan, dtype="float32")
-        if len(context) > cfg.max_context:
-            context = context[-cfg.max_context:]
-        if np.isnan(context).any() or np.std(context) < 1e-6:
-            return np.full(H, np.nan, dtype="float32")
-
-        with torch.inference_mode():
-            point_fcst, _ = model.forecast(horizon=H, inputs=[context])
-        # shape: (1, H)
-        return np.asarray(point_fcst[0, :H], dtype="float32")
-
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
-        start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=0,  # rely on min_context
-        ct_cutoff=ct_cutoff,
-        quiet=quiet,
-        model_name="TimesFM",
-        forecast_multi_step_fn=forecast_multi_step,
-        mode = mode
-    )
-    return r2, trues, preds, dates
-
-
-# 5.3 FlowState
-from tsfm_public import FlowStateForPrediction
-
-def flowstate_oos(
-    data: pd.DataFrame,
-    target_col="equity_premium",
-    start_oos="1965-01-01",
-    ctx=240,
-    freq="M",
-    prediction_length: int = 1,
-    scale_factor=0.25,
-    quantile=0.5,
-    ct_cutoff=False,
-    quiet=False,
-    model_name="FlowState (expanding)",
-    mode = "mean"
-):
-    df = ensure_datetime_index(data)
-    s = df[[target_col]].copy()
-
-    def align_freq(series, f):
-        z = series.copy()
-        z.index = z.index.to_period(f).to_timestamp(f)
-        z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(f)
-        z[target_col] = z[target_col].ffill()
-        return z
-
-    if freq in {"M", "MS"}:
-        s = align_freq(s, freq)
-        if s[target_col].isna().all():
-            alt = "M" if freq == "MS" else "MS"
-            s = align_freq(df[[target_col]], alt)
-            if not quiet:
-                print(f"[FlowState] Retried with freq='{alt}' because '{freq}' produced all-NaN.")
-            freq = alt
-    elif freq is not None:
-        s = s.asfreq(freq)
-        s[target_col] = s[target_col].ffill()
-
-    y = s[target_col].astype("float32")
-    if y.isna().all():
-        raise ValueError("Target is all NaN after preprocessing/alignment.")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    predictor = FlowStateForPrediction.from_pretrained("ibm-research/flowstate").to(device)
-
-    q_idx = {"value": None}
-
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
-        if len(y_hist) < ctx:
-            return np.full(H, np.nan, dtype="float32")
-
-        ctx_vals = y_hist.iloc[-ctx:].to_numpy(dtype="float32")
-        if np.isnan(ctx_vals).any():
-            return np.full(H, np.nan, dtype="float32")
-
-        ctx_tensor = torch.from_numpy(ctx_vals[:, None, None]).to(torch.float32).to(device)
-        with torch.inference_mode():
-            out = predictor(ctx_tensor, scale_factor=scale_factor, prediction_length=H, batch_first=False)
-        po = out.prediction_outputs  # expected shape: (1, num_quantiles, H, 1)
-
-        if q_idx["value"] is None:
-            if hasattr(out, "quantile_values"):
-                qs = torch.tensor(out.quantile_values, device=po.device)
-                q_idx["value"] = int(torch.argmin(torch.abs(qs - quantile)).item())
-            else:
-                q_idx["value"] = po.shape[1] // 2
-
-        # (H,) vector
-        vec = po[0, q_idx["value"], :H, 0].detach().cpu().numpy().astype("float32")
-        return vec
-
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
-        start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=0,  # rely on ctx
-        ct_cutoff=ct_cutoff,
-        quiet=quiet,
-        model_name=model_name,
-        forecast_multi_step_fn=forecast_multi_step,
-        mode = mode
-    )
-    return r2, trues, preds, dates
-
-
-# 5.4 Moirai2
+    return r2, stats, trues, preds, dates
+# 5.2 Moirai2
 from gluonts.dataset.common import ListDataset
 from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
-
 def moirai2_oos(
     data: pd.DataFrame,
     covariates=("d/p", "tms", "dfy"),
@@ -463,9 +499,17 @@ def moirai2_oos(
     FREQ_STR="M",
     mode = "mean"
 ):
-    if not quiet:
-        print(f"[Moirai2] Using freq='{FREQ_STR}' (month-end) | ctx={ctx} | H={prediction_length}")
+    """
+    Same as your original moirai2_oos, but using expanding_oos_tabular
+    instead of expanding_oos_univariate. Only supports 1-step ahead.
+    """
+    if prediction_length != 1:
+        raise ValueError("This moirai2_oos(tabular) version supports only prediction_length=1.")
 
+    if not quiet:
+        print(f"[Moirai2] Using freq='{FREQ_STR}' (month-end) | ctx={ctx} | H=1")
+
+    # ------- 1. Data prep (unchanged) -------
     df = ensure_datetime_index(data)
     df.index = df.index.to_period(FREQ_STR).to_timestamp(FREQ_STR)
     df = df.sort_index().asfreq(FREQ_STR)
@@ -479,19 +523,30 @@ def moirai2_oos(
     y = df["equity_premium"].astype("float32")
     cov_df = df[list(covariates)].astype("float32")
 
+    # ------- 2. Load Moirai2 (unchanged) -------
     module = Moirai2Module.from_pretrained("Salesforce/moirai-2.0-R-small")
 
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
+    # ------- 3. Fit/predict wrapper for tabular OOS -------
+    def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        """
+        Called by expanding_oos_tabular at each OOS date.
+        est  = past data up to t-1
+        row_t = row at time t (we use its timestamp)
+        """
+        date_t = row_t.name
+
+        # position in global y index (same as your original code)
         pos = y.index.get_loc(date_t)
         if isinstance(pos, slice):
             pos = pos.start
         if pos <= 0 or pos < 60:
-            return np.full(H, np.nan, dtype="float32")
+            return None
 
         y_hist_full = y.values[:pos]
         if len(y_hist_full) == 0:
-            return np.full(H, np.nan, dtype="float32")
+            return None
 
+        # context window
         if len(y_hist_full) > ctx:
             y_seg = y_hist_full[-ctx:]
             start_idx = pos - len(y_seg)
@@ -513,7 +568,7 @@ def moirai2_oos(
 
         model = Moirai2Forecast(
             module=module,
-            prediction_length=H,
+            prediction_length=1,      # 1-step only
             context_length=ctx,
             target_dim=1,
             feat_dynamic_real_dim=0,
@@ -526,23 +581,29 @@ def moirai2_oos(
             pass
 
         f = next(predictor.predict(ds_one))
-        q_med = f.quantile(0.5)  # shape: (H,)
-        vec = np.asarray(q_med[:H], dtype="float32")
-        return vec
+        q_med = f.quantile(0.5)  # shape: (1,)
+        fc = float(np.asarray(q_med[0], dtype="float32"))
+        return fc
 
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
+    # ------- 4. Use expanding_oos_tabular instead of univariate -------
+    # expanding_oos_tabular returns: r2, stats, trues, preds, dates
+    r2, stats, trues, preds, dates = expanding_oos_tabular(
+        df,
+        target_col="equity_premium",
+        feature_cols=[],              # all logic is inside model_fit_predict_fn
         start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=0,  # rely on pos>=60 + ctx
+        start_date=df.index.min().strftime("%Y-%m-%d"),
+        min_train=1,                  # real history check is inside model_fit_predict_fn (pos<60)
+        min_history_months=None,
         ct_cutoff=ct_cutoff,
         quiet=quiet,
         model_name=model_name,
-        forecast_multi_step_fn=forecast_multi_step,
-        mode = mode
+        model_fit_predict_fn=model_fit_predict_fn,
+        mode=mode,
     )
-    return r2, trues, preds, dates
 
+    # keep old return style (no stats)
+    return r2, trues, preds, dates
 
 # ================================================================
 # 6. TABPFN (tabular, 1-step) & TABPFN-TS (multi-step)
@@ -629,648 +690,265 @@ def tabpfn_oos_fit_each_step(
     )
 
 
-
-def tabpfn_ts_oos_fit_each_step(
-    data: pd.DataFrame,
-    target_col: str = "equity_premium",
-    start_oos: str = "1965-01-01",
-    ctx: int = 240,
-    freq: str = "M",
-    prediction_length: int = 1,
-    min_windows: int = 120,
-    ct_cutoff: bool = False,
-    quiet: bool = False,
-    model_name: str = "TabPFN-TS (fit each step)",
-    forecaster_repo: str = "tabpfn/tabpfn-ts",
-    fit_kwargs: dict | None = None,
-    mode = "mean"
-):
-    """
-    Expanding-window, multi-step OOS using TabPFN-TS, retrained at each origin.
-
-    Uses recursive predictions for horizons > 1.
-    """
-    import torch
-    try:
-        from tabpfn_ts import TabPFNForecaster
-    except Exception as e:
-        raise RuntimeError("tabpfn-ts not found. Install it first (`pip install tabpfn-ts`).") from e
-
-    if fit_kwargs is None:
-        fit_kwargs = {}
-
-    df = ensure_datetime_index(data)
-
-    if target_col not in df.columns:
-        raise ValueError(f"'{target_col}' not found.")
-
-    def align_freq(series: pd.DataFrame, f: str) -> pd.DataFrame:
-        z = series.copy()
-        z.index = z.index.to_period(f).to_timestamp(f)
-        z = z[~z.index.duplicated(keep="last")].sort_index().asfreq(f)
-        z[target_col] = z[target_col].ffill()
-        return z
-
-    s = align_freq(df[[target_col]], freq if freq in {"M", "MS"} else "M")
-    if s[target_col].isna().all() and freq in {"M", "MS"}:
-        alt = "M" if freq == "MS" else "MS"
-        s = align_freq(df[[target_col]], alt)
-        if not quiet:
-            print(f"[TabPFN-TS] Retried with freq='{alt}' because '{freq}' produced all-NaN.")
-        freq = alt
-
-    y = s[target_col].astype("float32")
-    if y.isna().all():
-        raise ValueError("Target is all NaN after preprocessing/alignment.")
-
-    if not quiet:
-        print(f"[TabPFN-TS] freq={freq} | rows={len(y)} | first={y.index.min().date()} | last={y.index.max().date()}")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def build_windows(arr: np.ndarray, end_pos: int, w: int):
-        """
-        Build contexts (N, w, 1) and targets (N,) from arr[:end_pos].
-        contexts[i] = arr[i : i+w], target[i] = arr[i+w]
-        """
-        N = end_pos - w
-        if N <= 0:
-            return None, None
-        X = np.lib.stride_tricks.sliding_window_view(arr[:end_pos], window_shape=w, axis=0)
-        X = X.astype("float32")[..., None]  # (N, w, 1)
-        y_next = arr[w:end_pos].astype("float32")  # length N
-        return X, y_next
-
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
-        pos = y.index.get_loc(date_t)
-        if isinstance(pos, slice):
-            pos = pos.start
-
-        if pos < ctx + min_windows:
-            return np.full(H, np.nan, dtype="float32")
-
-        contexts, targets = build_windows(y.values, end_pos=pos, w=ctx)
-        if contexts is None or len(contexts) < min_windows:
-            return np.full(H, np.nan, dtype="float32")
-        if np.isnan(contexts).any() or np.isnan(targets).any():
-            return np.full(H, np.nan, dtype="float32")
-
-        # we will recursively forecast using a copy of y_hist
-        history = y_hist.copy()
-
-        try:
-            model = TabPFNForecaster.from_pretrained(forecaster_repo).to(device)
-        except Exception:
-            model = TabPFNForecaster().to(device)
-        model.eval()
-
-        if hasattr(model, "fit"):
-            try:
-                model.fit(
-                    contexts=contexts,
-                    targets=targets,
-                    **fit_kwargs,
-                )
-            except Exception as e:
-                if not quiet:
-                    print(f"[TabPFN-TS] fit failed at {date_t.date()}: {e}")
-                return np.full(H, np.nan, dtype="float32")
-
-        preds = []
-        for h in range(H):
-            # last ctx window from current history
-            if len(history) < ctx:
-                return np.full(H, np.nan, dtype="float32")
-            ctx_vals = history.iloc[-ctx:].to_numpy(dtype="float32")
-            if np.isnan(ctx_vals).any():
-                return np.full(H, np.nan, dtype="float32")
-
-            ctx_last = ctx_vals[None, :, None]  # (1, ctx, 1)
-            with torch.inference_mode():
-                try:
-                    out = model.predict(ctx_last)  # (1, 1)
-                except Exception:
-                    ctx_tensor = torch.tensor(ctx_last, dtype=torch.float32, device=device)
-                    out = model.predict(ctx_tensor)
-                    if isinstance(out, torch.Tensor):
-                        out = out.detach().cpu().numpy()
-
-            y_hat = float(np.asarray(out).reshape(-1)[0])
-            preds.append(y_hat)
-            # append prediction to history for next step
-            history = pd.concat(
-                [history, pd.Series([y_hat], index=[history.index[-1] + (history.index[1] - history.index[0])])]
-            )
-
-        return np.asarray(preds, dtype="float32")
-
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
-        start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=0,  # rely on ctx + min_windows
-        ct_cutoff=ct_cutoff,
-        quiet=quiet,
-        model_name=model_name,
-        forecast_multi_step_fn=forecast_multi_step,
-        mode = mode
-    )
-    return r2, trues, preds, dates
-
-
-
-# 5.x AutoARIMA (univariate, multi-step)
-def autoarima_oos(
-    data: pd.DataFrame,
-    target_col: str = "equity_premium",
-    start_oos: str = "1965-01-01",
-    freq: str = "MS",
-    prediction_length: int = 1,
-    min_history_months: int = 60,
-    seasonal: bool | None = None,
-    m: int | None = None,
-    ct_cutoff: bool = True,
-    quiet: bool = False,
-    model_name: str = "AutoARIMA",
-    auto_arima_kwargs: dict | None = None,
-    order_search_every: int = None,    # optional: re-search every k steps
-    refit_each_step: bool = True,      # <-- NEW
-    mode: str = "mean",
-):
-    """
-    Expanding-window OOS for pmdarima.auto_arima with optional:
-      - hyperparameter re-search every k steps (order_search_every)
-      - refitting each step using last best (p,d,q)(P,D,Q,m)
-    """
-    from pmdarima import auto_arima, ARIMA
-
-    if auto_arima_kwargs is None:
-        auto_arima_kwargs = {}
-
-    df = ensure_datetime_index(data)
-    y = align_monthly(df[[target_col]], freq=freq, col=target_col)[target_col].astype("float32")
-
-    if seasonal is None:
-        seasonal = freq.upper() in {"M", "MS", "Q", "QS"}
-    if m is None:
-        m = 12 if freq.upper() in {"M", "MS"} else 1
-
-    state = {"order": None, "seasonal_order": None, "step": 0}
-
-    def forecast_multi_step(y_hist: pd.Series, date_t, H: int) -> np.ndarray:
-        state["step"] += 1
-        y_hist = y_hist.dropna()
-        if len(y_hist) < min_history_months:
-            return np.full(H, np.nan, dtype="float32")
-
-        # --- search or reuse order
-        need_search = (
-            state["order"] is None
-            or state["seasonal_order"] is None
-            or (order_search_every is not None
-                and state["step"] % order_search_every == 1)
-        )
-
-        if need_search:
-            if not quiet:
-                print(f"[AutoARIMA] Searching best order at {date_t.date()}...")
-            model = auto_arima(
-                y_hist.values,
-                seasonal=seasonal,
-                m=m,
-                error_action="ignore",
-                suppress_warnings=True,
-                stepwise=True,
-                **auto_arima_kwargs,
-            )
-            state["order"] = model.order
-            state["seasonal_order"] = model.seasonal_order
-            if not quiet:
-                print(f"  best order={model.order}, seasonal_order={model.seasonal_order}")
-        else:
-            model = ARIMA(
-                order=state["order"],
-                seasonal_order=state["seasonal_order"],
-                seasonal=seasonal,
-                m=m,
-            )
-
-        # --- always refit on current y_hist
-        if refit_each_step:
-            try:
-                model = model.fit(y_hist.values)
-            except Exception as e:
-                if not quiet:
-                    print(f"[AutoARIMA] fit failed at {date_t}: {e}")
-                return np.full(H, np.nan, dtype="float32")
-
-        try:
-            fc = model.predict(n_periods=H)
-        except Exception as e:
-            if not quiet:
-                print(f"[AutoARIMA] predict failed: {e}")
-            return np.full(H, np.nan, dtype="float32")
-
-        return np.asarray(fc, dtype="float32").reshape(-1)[:H]
-
-    r2, trues, preds, dates = expanding_oos_univariate(
-        y,
-        start_oos=start_oos,
-        prediction_length=prediction_length,
-        min_history_months=min_history_months,
-        ct_cutoff=ct_cutoff,
-        quiet=quiet,
-        model_name=model_name,
-        forecast_multi_step_fn=forecast_multi_step,
-        mode=mode,
-    )
-    return r2, trues, preds, dates
-
-
-
-
-
-import numpy as np, pandas as pd, torch, torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-
-class MLPReg(nn.Module):
-    def __init__(self, d_in):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, 1),
-        )
-    def forward(self, x):  # x: [B, d_in]
-        return self.net(x).squeeze(-1)  # [B]
-
-def make_mlp_lag_reg_fit_predict_fn(
-    base_cols,
-    target_col="equity_premium",
-    n_lags=12,
-    epochs=5,
-    batch_size=128,
-    lr=1e-3,
-    weight_decay=1e-2,
-    retrain_every=25,
-    print_loss=True,
-):
-    base_cols = list(base_cols)
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    model, scaler, step = None, None, 0
-    d_in = len(base_cols) * n_lags
-
-    def build_lagged(df: pd.DataFrame):
-        tmp = df[base_cols + [target_col]].copy()
-        for c in base_cols:
-            for k in range(1, n_lags + 1):
-                tmp[f"{c}_lag{k}"] = tmp[c].shift(k)
-        lag_cols = [f"{c}_lag{k}" for c in base_cols for k in range(1, n_lags + 1)]
-        tmp = tmp.dropna(subset=lag_cols + [target_col])
-        return tmp, lag_cols
-
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        nonlocal model, scaler, step
-        step += 1
-
-        # Prepare training data (past only)
-        tmp, lag_cols = build_lagged(est)
-        if tmp.empty:
-            return np.nan
-        X = tmp[lag_cols].to_numpy(np.float32)
-        y = tmp[target_col].to_numpy(np.float32)
-
-        # retrain periodically or on first call
-        if (model is None) or (step % retrain_every == 0):
-            scaler = StandardScaler().fit(X)
-            Xs = scaler.transform(X).astype(np.float32)
-
-            ds = TensorDataset(torch.from_numpy(Xs), torch.from_numpy(y))
-            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-            model = MLPReg(d_in=d_in).to(device)
-            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-            crit = nn.MSELoss()
-
-            model.train()
-            for ep in range(epochs):
-                run, nb = 0.0, 0
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    pred = model(xb)
-                    loss = crit(pred, yb)
-                    opt.zero_grad(); loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
-                    run += loss.item(); nb += 1
-                if print_loss:
-                    print(f"[MLPReg retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")
-
-        # Build x_t from the last n_lags of each base feature
-        lag_vals = []
-        for c in base_cols:
-            v = est[c].iloc[-n_lags:]
-            if len(v) < n_lags or v.isna().any():
-                return np.nan
-            lag_vals.extend(v.values)
-        x_t = np.asarray(lag_vals, np.float32).reshape(1, -1)
-
-        x_tn = torch.from_numpy(scaler.transform(x_t).astype(np.float32)).to(device)
-        model.eval()
-        with torch.inference_mode():
-            y_hat = float(model(x_tn).item())
-        return y_hat
-
-    return fit_predict
-
-
-
-import torch.nn as nn
-
-class LSTMReg(nn.Module):
-    def __init__(self, n_feat, hidden=64, num_layers=1, bidir=False, dropout=0.0):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=n_feat, hidden_size=hidden, num_layers=num_layers,
-            batch_first=True, bidirectional=bidir,
-            dropout=(dropout if num_layers > 1 else 0.0)
-        )
-        d = hidden * (2 if bidir else 1)
-        self.head = nn.Linear(d, 1)
-    def forward(self, x):        # x: [B, L, F]
-        out, _ = self.lstm(x)
-        z = out[:, -1, :]        # last timestep
-        return self.head(z).squeeze(-1)  # [B]
-
-def make_lstm_seq_reg_fit_predict_fn(
-    feature_cols,
-    target_col="equity_premium",
-    seq_len=24,
-    epochs=5,
-    batch_size=128,
-    lr=1e-3,
-    weight_decay=1e-2,
-    retrain_every=25,
-    hidden=64,
-    num_layers=1,
-    bidir=False,
-    dropout=0.0,
-    scale=True,
-    print_loss=True,
-):
-    feature_cols = list(feature_cols)
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    from sklearn.preprocessing import StandardScaler
-
-    model, scaler, step = None, None, 0
-    n_feat = len(feature_cols)
-
-    def make_windows(X_df: pd.DataFrame, y_ser: pd.Series):
-        X = X_df.to_numpy(np.float32)  # [T, F]
-        y = y_ser.to_numpy(np.float32) # [T]
-        T = len(X)
-        if T <= seq_len: return None, None
-        Xs, ys = [], []
-        for t in range(seq_len, T):
-            Xs.append(X[t-seq_len:t, :])   # [L, F]
-            ys.append(y[t])
-        return np.stack(Xs).astype(np.float32), np.asarray(ys, np.float32)
-
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        nonlocal model, scaler, step
-        step += 1
-        df = est.copy()
-        X_df = df[feature_cols].astype("float32")
-        y_ser = df[target_col].astype("float32")
-        if len(df) <= seq_len:
-            return np.nan
-
-        # scale features on history
-        if scale:
-            scaler = StandardScaler().fit(X_df.values)
-            X_hist = scaler.transform(X_df.values).astype(np.float32)
-            Xn_df = pd.DataFrame(X_hist, index=X_df.index, columns=X_df.columns)
-        else:
-            Xn_df = X_df
-
-        # retrain periodically or on first call
-        if (model is None) or (step % retrain_every == 0):
-            X_train, y_train = make_windows(Xn_df, y_ser)
-            if X_train is None or len(X_train) < 10:
-                return np.nan
-
-            ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-            model = LSTMReg(n_feat=n_feat, hidden=hidden, num_layers=num_layers,
-                            bidir=bidir, dropout=dropout).to(device)
-            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-            crit = nn.MSELoss()
-
-            model.train()
-            for ep in range(epochs):
-                run, nb = 0.0, 0
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    pred = model(xb)
-                    loss = crit(pred, yb)
-                    opt.zero_grad(); loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
-                    run += loss.item(); nb += 1
-                if print_loss:
-                    print(f"[LSTMReg retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")
-
-        # build one context window at t from last seq_len rows of est
-        X_hist = X_df.values.astype(np.float32)
-        if scale and scaler is not None:
-            X_hist = scaler.transform(X_hist).astype(np.float32)
-        if len(X_hist) < seq_len:
-            return np.nan
-        ctx = X_hist[-seq_len:, :]                     # [L, F]
-        x_ctx = torch.from_numpy(ctx.reshape(1, seq_len, n_feat)).to(device)
-
-        model.eval()
-        with torch.inference_mode():
-            y_hat = float(model(x_ctx).item())
-        return y_hat
-
-    return fit_predict
-
-
-import math
 import numpy as np
 import pandas as pd
+
+import pandas as pd
+import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+from tabpfn import TabPFNRegressor
 
-def pick_device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 4096):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe, persistent=False)  # [L, d_model]
-
-    def forward(self, x):  # x: [B, L, d_model]
-        L = x.size(1)
-        return x + self.pe[:L].unsqueeze(0)
-
-class TransformerReg(nn.Module):
+def add_ts_features(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, list]:
     """
-    Transformer encoder -> last-timestep pooling -> linear head -> scalar regression
+    Replicates the feature engineering of tabpfn-time-series:
+    1. RunningIndexFeature (Time progress)
+    2. CalendarFeature (Month, Quarter)
+    3. AutoSeasonalFeature (Proxy: Lag-12 for monthly data)
     """
-    def __init__(self, n_feat: int, d_model: int = 128, nhead: int = 4,
-                 num_layers: int = 2, dim_feedforward: int = 256,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.in_proj = nn.Linear(n_feat, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True, activation="gelu",
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.posenc = PositionalEncoding(d_model)
-        self.head = nn.Linear(d_model, 1)
+    df = df.copy()
+    new_cols = []
 
-    def forward(self, x):     # x: [B, L, F]
-        h = self.in_proj(x)   # [B, L, d_model]
-        h = self.posenc(h)    # + positional enc.
-        h = self.encoder(h)   # [B, L, d_model]
-        z = h[:, -1, :]       # use last timestep representation
-        y = self.head(z).squeeze(-1)  # [B]
-        return y
+    # --- 1. RunningIndexFeature ---
+    # Continuous float representation of time (normalized)
+    # This tells the Transformer "where" we are in history.
+    t_start = df.index[0].timestamp()
+    df["feat_running_index"] = (df.index.map(pd.Timestamp.timestamp) - t_start) / 31536000.0
+    new_cols.append("feat_running_index")
 
-def make_transformer_seq_reg_fit_predict_fn(
-    feature_cols,
-    target_col: str = "equity_premium",
-    seq_len: int = 24,
-    epochs: int = 5,
-    batch_size: int = 128,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-2,
-    retrain_every: int = 25,
-    d_model: int = 128,
-    nhead: int = 4,
-    num_layers: int = 2,
-    dim_feedforward: int = 256,
-    dropout: float = 0.1,
-    scale: bool = True,
-    print_loss: bool = True,
+    # --- 2. CalendarFeature ---
+    # Captures cyclical patterns (January effects, Quarter end effects)
+    # We treat these as integers; TabPFN handles them well.
+    df["feat_month"] = df.index.month
+    df["feat_quarter"] = df.index.quarter
+    new_cols.extend(["feat_month", "feat_quarter"])
+
+    # --- 3. AutoSeasonalFeature ---
+    # The strongest seasonality for monthly financial data is usually Year-over-Year.
+    # We add the target value from exactly 1 year ago (Lag 12).
+    # If you have higher frequency data, adjust '12'.
+    seasonal_lag = 12
+    col_seasonal = f"feat_seasonal_lag{seasonal_lag}"
+    df[col_seasonal] = df[target_col].shift(seasonal_lag)
+    new_cols.append(col_seasonal)
+
+    return df, new_cols
+import pandas as pd
+import numpy as np
+import torch
+from scipy.signal import find_peaks
+from tabpfn import TabPFNRegressor
+
+# -------------------------------------------------------------------------
+# 1. Calendar Features (Refined for Monthly/Daily Data)
+# -------------------------------------------------------------------------
+def get_calendar_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Extracts cyclic calendar components relevant for low-frequency (daily/monthly) data.
+    Removed: Second, Minute, Hour.
+    Kept: Day of week, Day of month, Day of year, Week, Month.
+    """
+    df_cal = pd.DataFrame(index=dates)
+    
+    # 1. Linear Year Feature
+    df_cal["year"] = dates.year.astype(float)
+    
+    # 2. Cyclic Features with defined periods (P)
+    cycles = [
+        # (name, period_length, extraction_func)
+        ("day_of_week", 7, lambda x: x.dayofweek),     # 0=Mon, 6=Sun
+        ("day_of_month", 30.5, lambda x: x.day),       # Paper uses 30.5 approximation
+        ("day_of_year", 365, lambda x: x.dayofyear),
+        ("week_of_year", 52, lambda x: x.isocalendar().week),
+        ("month_of_year", 12, lambda x: x.month),
+    ]
+    
+    for name, period, func in cycles:
+        vals = func(dates).astype(float)
+        # Transform to Sin/Cos pairs
+        rads = 2 * np.pi * vals / period
+        df_cal[f"{name}_sin"] = np.sin(rads)
+        df_cal[f"{name}_cos"] = np.cos(rads)
+        
+    return df_cal
+
+# -------------------------------------------------------------------------
+# 2. Automatic Seasonal Features (FFT Based)
+# -------------------------------------------------------------------------
+def get_auto_seasonal_features(
+    y_history: np.ndarray, 
+    full_length: int, 
+    k: int = 5
+) -> pd.DataFrame:
+    """
+    Extracts top-k periodicities using FFT and creates sin/cos features.
+    """
+    N = len(y_history)
+    # If history is too short, return empty features
+    if N < 12: 
+        return pd.DataFrame(index=range(full_length))
+
+    # A. Preprocessing: Detrend (Linear)
+    t = np.arange(N)
+    A = np.vstack([t, np.ones(len(t))]).T
+    # Least squares detrending
+    m, c = np.linalg.lstsq(A, y_history, rcond=None)[0]
+    y_detrend = y_history - (m * t + c)
+
+    # B. Apply Hann Window
+    hann_win = np.hanning(N) 
+    y_windowed = y_detrend * hann_win
+
+    # C. Zero-Pad to 2N (Paper suggests symmetric zero-padding)
+    y_padded = np.pad(y_windowed, (0, N), 'constant')
+
+    # D. FFT & Magnitudes
+    fft_vals = np.fft.rfft(y_padded)
+    magnitudes = np.abs(fft_vals)
+    magnitudes[0] = 0 # Remove DC component - THIS WAS THE LINE WITH THE ERROR
+    
+    # E. Find Peaks & Select Top K
+    peaks, _ = find_peaks(magnitudes)
+    if len(peaks) == 0:
+        return pd.DataFrame(index=range(full_length))
+        
+    # Sort peaks by magnitude descending and keep top k
+    top_peaks = sorted(peaks, key=lambda x: magnitudes[x], reverse=True)[:k]
+    
+    # F. Create Features
+    features = {}
+    t_full = np.arange(full_length) # Time index for whole range
+    
+    for i, peak_idx in enumerate(top_peaks):
+        # Frequency = index / length of FFT buffer (2N)
+        f = peak_idx / len(y_padded) 
+        
+        rads = 2 * np.pi * f * t_full
+        features[f"auto_seas_{i}_sin"] = np.sin(rads)
+        features[f"auto_seas_{i}_cos"] = np.cos(rads)
+
+    return pd.DataFrame(features)
+
+# -------------------------------------------------------------------------
+# 3. Main Driver 
+# -------------------------------------------------------------------------
+def tabpfn_ts_full_features(
+    data: pd.DataFrame,
+    variables=("d/p", "tms", "dfy"),
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    start_date="1927-01-01",
+    lag=1,
+    k_seasonal=5, 
+    min_train=120,
+    ct_cutoff=True,
+    quiet=False,
+    model_params='2.5',
+    mode="mean"
 ):
-    """
-    Builds a fit_predict(est,row_t)->float for expanding_oos_tabular (regression).
-    Uses a Transformer encoder over the last `seq_len` steps of `feature_cols`.
-    """
-    device = pick_device()
-    feature_cols = list(feature_cols)
-    n_feat = len(feature_cols)
+    # 1. Setup Data
+    df = ensure_datetime_index(data).copy()
+    df = df.sort_index()
+    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
-    model, scaler, step = None, None, 0
-    crit = nn.MSELoss()
+    # 2. Pre-calculate Static Features 
+    
+    # A. Running Index
+    # Normalized time index (approx years passed)
+    t_start = df.index[0].timestamp()
+    df["running_index"] = (df.index.map(pd.Timestamp.timestamp) - t_start) / 31536000.0
+    
+    # B. Calendar Features (using the refined function above)
+    df_cal = get_calendar_features(df.index)
+    df = pd.concat([df, df_cal], axis=1)
+    
+    cal_cols = df_cal.columns.tolist()
+    idx_col = ["running_index"]
+    
+    # C. Lagged Covariates (Standard TS practice)
+    macro_cols = []
+    lag_range = range(1, lag + 1)
+    for v in variables:
+        for L in lag_range:
+            col_name = f"{v}_lag{L}"
+            df[col_name] = df[v].shift(L)
+            macro_cols.append(col_name)
 
-    def make_windows(X_df: pd.DataFrame, y_ser: pd.Series):
-        X = X_df.to_numpy(np.float32)      # [T, F]
-        y = y_ser.to_numpy(np.float32)     # [T]
-        T = len(X)
-        if T <= seq_len:
-            return None, None
-        Xs, ys = [], []
-        for t in range(seq_len, T):
-            Xs.append(X[t-seq_len:t, :])   # [L, F]
-            ys.append(y[t])
-        return np.stack(Xs).astype(np.float32), np.asarray(ys, np.float32)
+    # D. Lagged Target (Autoregression)
+    ar_cols = []
+    for L in lag_range:
+        col_name = f"AR_lag{L}"
+        df[col_name] = df[target_col].shift(L)
+        ar_cols.append(col_name)
 
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        nonlocal model, scaler, step
-        step += 1
+    # Combine static features to track
+    static_features = idx_col + cal_cols + macro_cols + ar_cols
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        df = est.copy()
-        if any(c not in df.columns for c in feature_cols+[target_col]):
-            return np.nan
-        X_df = df[feature_cols].astype("float32")
-        y_ser = df[target_col].astype("float32")
-        if len(df) <= seq_len:
-            return np.nan
+    # ---------------------------------------------------------------------
+    # Fit/Predict Function
+    # ---------------------------------------------------------------------
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        # 1. Clean Data
+        est_clean = est.dropna(subset=[target_col] + static_features)
+        
+        if len(est_clean) < min_train:
+            return None
+        if row_t[static_features].isna().any():
+            return None
 
-        # scale features on history
-        if scale:
-            scaler = StandardScaler().fit(X_df.values)
-            X_hist = scaler.transform(X_df.values).astype(np.float32)
-            Xn_df = pd.DataFrame(X_hist, index=X_df.index, columns=X_df.columns)
+        # 2. Compute Auto-Seasonal Features (Dynamic)
+        # We compute these strictly from history to avoid look-ahead bias
+        y_hist = est_clean[target_col].to_numpy(float)
+        
+        # We need features for N history points + 1 test point
+        df_seas = get_auto_seasonal_features(y_hist, full_length=len(y_hist)+1, k=k_seasonal)
+        
+        # Split back into train/test
+        X_seas_train = df_seas.iloc[:-1].to_numpy(float)
+        X_seas_test = df_seas.iloc[-1:].to_numpy(float) 
+        
+        # 3. Construct Final X Matrices
+        X_static_train = est_clean[static_features].to_numpy(float)
+        X_train = np.hstack([X_static_train, X_seas_train])
+        y_train = y_hist
+        
+        X_static_test = row_t[static_features].to_numpy(float).reshape(1, -1)
+        X_pred = np.hstack([X_static_test, X_seas_test])
+
+        # 4. TabPFN Inference
+        if model_params == '2.5':
+             model = TabPFNRegressor(device=device)
         else:
-            Xn_df = X_df
+             model = TabPFNRegressor(device=device)
 
-        # (re)train periodically
-        need_train = (model is None) or (step % retrain_every == 0)
-        if need_train:
-            X_train, y_train = make_windows(Xn_df, y_ser)
-            if X_train is None or len(X_train) < 10:
-                return np.nan
+        model.fit(X_train, y_train)
+        return float(model.predict(X_pred)[0])
 
-            ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    # ---------------------------------------------------------------------
+    # Run OOS Loop
+    # ---------------------------------------------------------------------
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=static_features,
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name="TabPFN-TS (Refined Features)",
+        model_fit_predict_fn=fit_predict,
+        mode=mode
+    )
 
-            model = TransformerReg(
-                n_feat=n_feat, d_model=d_model, nhead=nhead,
-                num_layers=num_layers, dim_feedforward=dim_feedforward,
-                dropout=dropout
-            ).to(device)
-            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if 'date' in df.columns:
+            df = df.set_index('date')
+        elif 'Date' in df.columns:
+            df = df.set_index('Date')
+        df.index = pd.to_datetime(df.index)
+    return df
 
-            model.train()
-            for ep in range(epochs):
-                run, nb = 0.0, 0
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    pred = model(xb)
-                    loss = crit(pred, yb)
-                    opt.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
-                    run += loss.item(); nb += 1
-                if print_loss:
-                    print(f"[TransformerReg retrain] epoch {ep+1}/{epochs} | loss={run/max(1,nb):.6f}")
 
-        # ---- one-step-ahead prediction at time t ----
-        # build single context window from raw history, then scale if needed
-        X_hist_raw = df[feature_cols].to_numpy(np.float32)
-        if len(X_hist_raw) < seq_len:
-            return np.nan
-        if scale and scaler is not None:
-            X_hist_raw = scaler.transform(X_hist_raw).astype(np.float32)
-
-        ctx = X_hist_raw[-seq_len:, :]  # [L, F]
-        x_ctx = torch.from_numpy(ctx.reshape(1, seq_len, n_feat)).to(device)
-        model.eval()
-        with torch.inference_mode():
-            y_hat = float(model(x_ctx).item())
-        return y_hat
-
-    return fit_predict
