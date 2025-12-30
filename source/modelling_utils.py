@@ -201,6 +201,7 @@ def baseline_classification(y_true, mode: str = "majority"):
 def evaluate_oos(
     y_true, 
     y_pred, 
+    y_bench,
     model_name="Model", 
     device="cpu", 
     quiet=False, 
@@ -216,8 +217,9 @@ def evaluate_oos(
     y_pred = np.asarray(y_pred, float)
 
     # Filter NaNs
-    m = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_true, y_pred = y_true[m], y_pred[m]
+    m = ~np.isnan(y_true) & ~np.isnan(y_pred) & ~np.isnan(y_bench)    
+    
+    y_true, y_pred, y_bench = y_true[m], y_pred[m], y_bench[m]
 
     if len(y_true) == 0:
         if not quiet:
@@ -230,9 +232,9 @@ def evaluate_oos(
 
     # Generate the Baseline Prediction Vector
     # (Assuming baseline_forecast returns an array of shape y_true)
-    mean_forecast = baseline_forecast(y_true, mode=mode)
+    #mean_forecast = baseline_forecast(y_true, mode=mode)
     
-    denom = np.sum((y_true - mean_forecast) ** 2)
+    denom = np.sum((y_true - y_bench) ** 2)
     
     if denom > 0:
         r2_oos = float(1 - np.sum((y_true - y_pred) ** 2) / denom)
@@ -243,7 +245,7 @@ def evaluate_oos(
     stats = calculate_block_bootstrap_stats(
         y_true, 
         y_pred, 
-        mean_forecast, 
+        y_bench, 
         block_size=12, 
         n_bootstraps=1000
     )
@@ -458,12 +460,13 @@ def expanding_oos_tabular(
 
     loop_dates = df.index[df.index >= start_ts]
 
-    preds, trues, oos_dates = [], [], []
+    preds, trues, oos_dates, HA = [], [], [], []
 
     for date_t in loop_dates:
-        print( date_t)
+        if not quiet:
+            print(date_t)
         pos = df.index.get_loc(date_t)
-        est = df.iloc[:pos].copy()        # strictly past
+        est = df.iloc[:pos].copy()        
         row_t = df.iloc[pos]
 
         if est[target_col].notna().sum() < min_train:
@@ -480,122 +483,25 @@ def expanding_oos_tabular(
         if ct_cutoff:
             y_hat = float(ct_truncate(y_hat))
 
+
         preds.append(float(y_hat))
         trues.append(y_true)
         oos_dates.append(date_t)
+        ha_t = float(est[target_col].dropna().mean()) 
+        HA.append(ha_t)       
 
     if not preds:
         raise RuntimeError(f"[{model_name}] No valid predictions produced.")
 
     trues = np.asarray(trues, float)
-    preds = np.asarray(preds, float)
-    r2,stats = evaluate_oos(trues, preds, model_name=model_name, device="cpu", quiet=quiet, mode = mode)
+    preds = np.asarray(preds, float)        
+    HA = np.asarray(HA, float)
+    r2_oos = 1 - np.sum((trues - preds)**2) / np.sum((trues - HA)**2)
+    print(f"Manually calculated R2: {r2_oos}")
+
+    r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, device="cpu", quiet=quiet, mode = mode)
     return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates)
 
-
-# def expanding_oos_univariate(
-#     y: pd.Series,
-#     start_oos: str = "1965-01-01",
-#     prediction_length: int = 1,
-#     min_history_months: int = 240,
-#     ct_cutoff: bool = False,
-#     quiet: bool = False,
-#     model_name: str = "TS-Model",
-#     forecast_multi_step_fn: Callable[[pd.Series, pd.Timestamp, int], np.ndarray] | None = None,
-#     mode = "mean",
-# ) -> Tuple[
-#     Dict[int, float],
-#     Dict[int, np.ndarray],
-#     Dict[int, np.ndarray],
-#     Dict[int, pd.DatetimeIndex],
-# ]:
-#     """
-#     Generic expanding-window univariate OOS driver with arbitrary prediction_length.
-
-#     forecast_multi_step_fn(y_hist, origin_date, prediction_length) -> array of shape (H,)
-
-#     Returns dicts keyed by horizon h = 1..H:
-#       - r2[h]       : scalar R²_OS for horizon h
-#       - trues[h]    : np.array of true values at horizon h
-#       - preds[h]    : np.array of predictions at horizon h
-#       - dates[h]    : DatetimeIndex of evaluation dates for horizon h
-#     """
-#     if forecast_multi_step_fn is None:
-#         raise ValueError("forecast_multi_step_fn must be provided.")
-#     if prediction_length <= 0:
-#         raise ValueError("prediction_length must be >= 1")
-
-#     y = y.astype("float32").dropna()
-#     if y.empty:
-#         raise ValueError("Target series is empty after cleaning.")
-
-#     # enforce min history before first origin
-#     start_ts = expand_start_with_min_history(
-#         y.index, start_oos, min_history_months=min_history_months
-#     )
-
-#     # also need enough future data to evaluate all horizons
-#     last_valid_origin = y.index[-prediction_length]  # index for t such that t+H-1 exists
-#     test_idx = y.index[(y.index >= start_ts) & (y.index <= last_valid_origin)]
-
-#     if not quiet:
-#         print(f"[{model_name}] prediction_length={prediction_length}, "
-#               f"origins={len(test_idx)}, first_origin={test_idx[0].date()}, "
-#               f"last_origin={test_idx[-1].date()}")
-
-#     preds = {h: [] for h in range(1, prediction_length+1)}
-#     trues = {h: [] for h in range(1, prediction_length+1)}
-#     dates = {h: [] for h in range(1, prediction_length+1)}
-
-#     for date_t in test_idx:
-#         print(date_t)
-#         pos = y.index.get_loc(date_t)
-#         if isinstance(pos, slice):
-#             pos = pos.start
-
-#         y_hist = y.iloc[:pos]
-#         if y_hist.isna().any():
-#             continue
-
-#         y_hat_vec = forecast_multi_step_fn(y_hist, date_t, prediction_length)
-#         y_hat_vec = np.asarray(y_hat_vec, float).reshape(-1)
-#         if len(y_hat_vec) < prediction_length:
-#             continue
-
-#         for h in range(1, prediction_length + 1):
-#             target_pos = pos + (h - 1)
-#             y_true = float(y.iloc[target_pos])
-#             y_hat = float(y_hat_vec[h-1])
-#             if np.isnan(y_true) or np.isnan(y_hat):
-#                 continue
-#             if ct_cutoff:
-#                 y_hat = float(ct_truncate(y_hat))
-#             trues[h].append(y_true)
-#             preds[h].append(y_hat)
-#             dates[h].append(y.index[target_pos])
-
-#     # convert to arrays/index & compute R² per horizon
-#     r2 = {}
-#     for h in range(1, prediction_length+1):
-#         trues[h] = np.asarray(trues[h], float)
-#         preds[h] = np.asarray(preds[h], float)
-#         dates[h] = pd.DatetimeIndex(dates[h])
-
-#         if len(trues[h]) == 0:
-#             r2[h] = np.nan
-#             if not quiet:
-#                 print(f"[{model_name}] horizon h={h}: no valid predictions.")
-#         else:
-#             r2[h] = evaluate_oos(
-#                 trues[h],
-#                 preds[h],
-#                 model_name=f"{model_name} (h={h})",
-#                 device="cpu",
-#                 quiet=quiet,
-#                 mode = mode
-#             )
-
-#     return r2, trues, preds, dates
 
 
 def expanding_oos_tabular_cls(

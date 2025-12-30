@@ -16,14 +16,13 @@ def format_date(df):
     df.drop(columns=['yyyymm'], inplace=True)
     return df
 
-def calc_equity_premium(df, uselog = True):
-    """Calculate the equity premium."""
-    # compute the equity premium (Goyal and Welch, 2002)
-    # equity premium (or market premium) = return on the stock market (Rm(t)) - return on a short-term risk free treasury bill Rf(t)
-    # more in detail: paper relies on the well-known (value-weighted CRSP index) return on the stock market and the 3-month risk-free treasury bill (called Rf(t) and obtained from Ibbotson)
-    # This translates to ret (return w/ dividends (CRSP calc)) and Rfree (riskfree return)
-    # to predict only data from 1926 onwards is used
-    df['equity_premium'] = np.log1p(df['ret']) - np.log1p(df['Rfree'])
+def calc_equity_premium(df, uselog=True):
+    # ret and Rfree are simple monthly returns (decimals) in this GW file
+    if uselog:
+        df["equity_premium"] = np.log1p(df["ret"]) - np.log1p(df["Rfree"])
+        # equivalent: np.log((1+df["ret"]) / (1+df["Rfree"]))
+    else:
+        df["equity_premium"] = df["ret"] - df["Rfree"]
     return df
 
 def drop_na_after_1926(df):
@@ -34,11 +33,11 @@ def drop_na_after_1926(df):
     after  = (idx >= start) & df['equity_premium'].notna()
     return df.loc[before | after]
 
-def prepare_data(file_path="../../Data/GoyalAndWelch.xlsx"):
+def prepare_data(file_path="../../Data/GoyalAndWelch.xlsx", uselog = True):
     """Load and prepare the data."""
     df = load_data(file_path)
     df = format_date(df)
-    df = calc_equity_premium(df)
+    df = calc_equity_premium(df, uselog=uselog)
     df = drop_na_after_1926(df)
     return df
 

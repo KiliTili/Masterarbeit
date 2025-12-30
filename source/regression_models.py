@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.abspath('../'))
 
-from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular
+from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular, plot_oos
 import torch
 import random, numpy as np, torch
 
@@ -49,7 +49,7 @@ def ols_oos(
     start_oos="1965-01-01",
     start_date="1927-01-01",
     lag=1,
-    min_train=30,
+    min_train=240,
     ct_cutoff: bool = False,
     quiet: bool = False,
     model_name: str | None = None,
@@ -300,11 +300,11 @@ def autoarima_oos(
     # 1. Prepare target series at MONTH-START frequency
     # ------------------------------------------------------------------
     df = ensure_datetime_index(data)
+    df = df.sort_index()
+    df.index = df.index.to_period("M").to_timestamp("MS")
 
-    # We FORCE month-start alignment here, regardless of `freq` passed in,
-    # so that AutoARIMA sees the same month-start grid as the rest of your data.
-    df_ms = align_monthly(df[[target_col]], freq=freq, col=target_col)
-    y = df_ms[target_col].astype("float32")
+    y = df[target_col].astype(float)
+
 
     # ------------------------------------------------------------------
     # 2. Seasonal settings (still based on user freq, but everything is monthly)
@@ -443,7 +443,8 @@ def chronos_oos(
     ctx_min: int = 24,
     ct_cutoff=True,
     quiet=False,
-    mode = "mean"
+    mode = "mean",
+    model_id = "amazon/chronos-bolt-small"
 ):
     """
     1-step-ahead Chronos-Bolt OOS evaluation using expanding_oos_tabular.
@@ -454,12 +455,12 @@ def chronos_oos(
         raise ValueError("This chronos_oos version supports only prediction_length=1.")
 
     df = ensure_datetime_index(data)
-    y_df = align_monthly(df[[target_col]], freq=freq, col=target_col)
+    y_df = df[[target_col]] #align_monthly(df[[target_col]], freq=freq, col=target_col)
     y = y_df[target_col].astype("float32")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = BaseChronosPipeline.from_pretrained(
-        "amazon/chronos-bolt-small",
+        model_id,
         device_map=device,
         torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     )
@@ -470,10 +471,12 @@ def chronos_oos(
             return None
         with torch.inference_mode():
             _, mean_pred = pipe.predict_quantiles(
-                context=[torch.tensor(ctx, device=device)],
+                inputs=[torch.tensor(ctx, device=device)],
                 prediction_length=1,
                 quantile_levels=[0.5],
             )
+        if model_id == "amazon/chronos-2":
+            return float(mean_pred[0][0])
         return float(mean_pred[0, 0])
 
     def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
@@ -957,3 +960,133 @@ def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+def chronos2_oos(
+    data: pd.DataFrame,
+    covariates=("d/p", "tms", "dfy"),
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    freq="MS",
+    prediction_length: int = 1,
+    ctx_min: int = 24,
+    ct_cutoff=True,
+    quiet=False,
+    mode="mean",
+    model_id="amazon/chronos-2"
+):
+    """
+    1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
+    """
+    if prediction_length != 1:
+        raise ValueError("This chronos2_oos version supports only prediction_length=1.")
+
+    # ------- 1. Data Prep -------
+    # Ensure index is datetime
+    if not isinstance(data.index, pd.DatetimeIndex):
+        df = data.copy()
+        df.index = pd.to_datetime(df.index)
+    else:
+        df = data.copy()
+
+    # Sort
+    df = df.sort_index()
+
+    # Ensure all columns exist
+    needed = [target_col] + list(covariates)
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+    
+    # Extract arrays for fast indexing
+    y = df[target_col].astype("float32")
+    cov_df = df[list(covariates)].astype("float32")
+
+    if not quiet:
+        print(f"[Chronos-2] Loading {model_id} on {freq} freq with {len(covariates)} covariates...")
+
+    # ------- 2. Load Chronos-2 -------
+    if torch.backends.mps.is_available():
+        device_map = torch.device("mps")
+    elif torch.cuda.is_available():
+        device_map = torch.device("cuda")
+    else:
+        device_map = torch.device("cpu")
+    # Use bfloat16 if on CUDA, else float32
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    
+    pipeline = BaseChronosPipeline.from_pretrained(
+        model_id,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+    )
+
+    # ------- 3. Define Fit/Predict Logic -------
+    def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        """
+        row_t is the row we want to predict (time t).
+        We use data UP TO time t (predictors at t are known).
+        """
+        date_t = row_t.name
+        
+        # Get integer location of the prediction date
+        try:
+            pos = df.index.get_loc(date_t)
+        except KeyError:
+            return None
+            
+        # We need at least ctx_min history
+        if pos < ctx_min:
+            return None
+
+        # 1. Target History: 0 ... t-1
+        target_hist = y.values[:pos]
+        # 2. Past Covariates: 0 ... t-1
+        past_covs = {
+            col: cov_df[col].values[:pos] 
+            for col in covariates
+        }
+        
+        # 3. Future Covariates: t ... t (length 1)
+        # Predictors at time t are known and valid for predicting t+1
+        # future_covs = {
+        #     col: cov_df[col].values[pos:pos+1] 
+        #     for col in covariates
+        # }
+
+        # Construct input dictionary
+        entry = {
+            "target": target_hist,
+            "past_covariates": past_covs,
+            # "future_covariates": future_covs
+        }
+
+        # Predict
+        with torch.inference_mode():
+            # Returns a LIST of tensors (one per input)
+            _, mean_pred = pipeline.predict_quantiles(
+                inputs=[entry],
+                prediction_length=1,
+                quantile_levels=[0.5], 
+            )
+            
+        # Extract the scalar prediction
+        # mean_pred is a list -> mean_pred[0] is the tensor -> [0, 0] is the value
+        return float(mean_pred[0][0, 0].item())
+
+    # ------- 4. Run Expanding Loop -------
+    r2, stats, trues, preds, dates = expanding_oos_tabular(
+        df, 
+        target_col=target_col,
+        feature_cols=[], # Logic handled inside function manually
+        start_oos=start_oos,
+        start_date=df.index.min().strftime("%Y-%m-%d"),
+        min_train=ctx_min,
+        min_history_months=ctx_min,
+        ct_cutoff=ct_cutoff,
+        quiet=quiet,
+        model_name="Chronos-2 (w/ Covariates)",
+        model_fit_predict_fn=model_fit_predict_fn,
+        mode=mode,
+    )
+
+    return r2, trues, preds, dates
