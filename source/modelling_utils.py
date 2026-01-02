@@ -203,9 +203,7 @@ def evaluate_oos(
     y_pred, 
     y_bench,
     model_name="Model", 
-    device="cpu", 
-    quiet=False, 
-    mode: str = "mean"
+    quiet=False
 ):
     """
     Compute MSE, RMSE and out-of-sample R² (Campbell–Thompson style)
@@ -325,12 +323,17 @@ def evaluate_oos_classification(
 def plot_oos(
     y_true,
     y_pred,
+    y_baseline,
     dates=None,
     title="Out-of-sample forecast",
     ylabel="Equity premium",
     save_path=None,
     show=True,
-    mode = 'mean'
+    y_lower = None,
+    y_upper = None,
+    ci_alpha = 0.2,
+    ci_label = "Prediction 90% CI"
+
 ):
     """
     Plot true values, model predictions, and expanding-mean benchmark.
@@ -338,12 +341,25 @@ def plot_oos(
     """
     y_true = np.asarray(y_true, float)
     y_pred = np.asarray(y_pred, float)
-    m = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    if y_lower is not None:                                          
+        y_lower = np.asarray(y_lower, float)                         
+    if y_upper is not None:                                          
+        y_upper = np.asarray(y_upper, float)                         
+
+    m = ~np.isnan(y_true) & ~np.isnan(y_pred)                       
+    if y_lower is not None:                                         
+        m &= ~np.isnan(y_lower)                                     
+    if y_upper is not None:                                         
+        m &= ~np.isnan(y_upper)                                     
     y_true, y_pred = y_true[m], y_pred[m]
+    if y_lower is not None:                                           
+        y_lower = y_lower[m]                                          
+    if y_upper is not None:                                           
+        y_upper = y_upper[m]                                          
 
     #csum = np.cumsum(y_true)
     #mean_forecast = csum / np.arange(1, len(y_true) + 1)
-    mean_forecast = baseline_forecast(y_true,mode)
+    mean_forecast = np.array(y_baseline)
     if dates is not None:
         x = pd.to_datetime(pd.Index(dates))[m]
     else:
@@ -352,6 +368,8 @@ def plot_oos(
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(x, y_true, label="True")
     ax.plot(x, y_pred, label="Prediction")
+    if (y_lower is not None) and (y_upper is not None):               
+        ax.fill_between(x, y_lower, y_upper, alpha=ci_alpha,label=ci_label) 
     ax.plot(x, mean_forecast, label="Expanding mean", linestyle="--")
     ax.set_title(title)
     ax.set_ylabel(ylabel)
@@ -460,8 +478,8 @@ def expanding_oos_tabular(
 
     loop_dates = df.index[df.index >= start_ts]
 
-    preds, trues, oos_dates, HA = [], [], [], []
-
+    preds, trues, oos_dates, HA, y_lowers, y_uppers = [], [], [], [], [], []
+    truncated = 0
     for date_t in loop_dates:
         if not quiet:
             print(date_t)
@@ -476,11 +494,21 @@ def expanding_oos_tabular(
         if np.isnan(y_true):
             continue
 
-        y_hat = model_fit_predict_fn(est, row_t)
+        #y_hat = model_fit_predict_fn(est, row_t)
+        results = model_fit_predict_fn(est, row_t)
+        if isinstance(results, (list, tuple)):
+            y_hat, y_lower, y_upper = results
+        else:
+            y_hat = results
+            y_lower = None
+            y_upper = None
+
         if y_hat is None or np.isnan(y_hat):
             continue
 
         if ct_cutoff:
+            if y_hat < 0:
+                truncated += 1
             y_hat = float(ct_truncate(y_hat))
 
 
@@ -488,19 +516,26 @@ def expanding_oos_tabular(
         trues.append(y_true)
         oos_dates.append(date_t)
         ha_t = float(est[target_col].dropna().mean()) 
-        HA.append(ha_t)       
+        HA.append(ha_t)      
+        y_lowers.append(y_lower)
+        y_uppers.append(y_upper)
 
     if not preds:
         raise RuntimeError(f"[{model_name}] No valid predictions produced.")
 
+    if not quiet:
+        print(f"percentage of negative forecasts before truncation: {truncated/len(preds)*100:.2f}%")
+        
+
+     # Manually calculate R2 for verification
     trues = np.asarray(trues, float)
     preds = np.asarray(preds, float)        
     HA = np.asarray(HA, float)
     r2_oos = 1 - np.sum((trues - preds)**2) / np.sum((trues - HA)**2)
     print(f"Manually calculated R2: {r2_oos}")
 
-    r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, device="cpu", quiet=quiet, mode = mode)
-    return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates)
+    r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
+    return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA
 
 
 

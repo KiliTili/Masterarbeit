@@ -53,7 +53,7 @@ def ols_oos(
     ct_cutoff: bool = False,
     quiet: bool = False,
     model_name: str | None = None,
-    mode = "mean"
+    ci = 0.9,
 ):
     """
     Expanding-window OLS with lagged predictors (1-step ahead).
@@ -66,8 +66,9 @@ def ols_oos(
     df = make_lagged_features(df, variables, lag)
 
     feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag+1)]
+    from scipy.stats import norm            
 
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
         est = est.dropna(subset=feature_cols + [target_col])
         if len(est) < min_train:
             return None
@@ -80,7 +81,18 @@ def ols_oos(
         x_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
 
         model = LinearRegression().fit(X_train, y_train)
-        return float(model.predict(x_pred)[0])
+        y_hat = float(model.predict(x_pred)[0])
+        y_fitted = model.predict(X_train)                 # CHANGED
+        resid = y_train - y_fitted                         # CHANGED
+        sigma = np.sqrt(np.mean(resid ** 2))               # CHANGED
+
+        z = norm.ppf(0.5 + ci / 2)                          # CHANGED
+        y_lo = y_hat - z * sigma                            # CHANGED
+        y_hi = y_hat + z * sigma                            # CHANGED
+
+        return [y_hat, y_lo, y_hi]                          # CHANGED
+            
+
 
     return expanding_oos_tabular(
         df,
@@ -94,7 +106,6 @@ def ols_oos(
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
-        mode = mode
     )
 
 
@@ -113,7 +124,7 @@ def rank_monthly_predictors(
     results = []
     for v in monthly_vars:
         try:
-            r2,_, _, _, _ = ols_oos(
+            r2,_, _, _, _,_,_,_ = ols_oos(
                 data,
                 variables=(v,),
                 target_col="equity_premium",
@@ -301,7 +312,7 @@ def autoarima_oos(
     # ------------------------------------------------------------------
     df = ensure_datetime_index(data)
     df = df.sort_index()
-    df.index = df.index.to_period("M").to_timestamp("MS")
+    #df.index = df.index.to_period("M").to_timestamp("MS")
 
     y = df[target_col].astype(float)
 
@@ -410,15 +421,14 @@ def autoarima_oos(
             return None
         return forecast_one_step(y_hist, date_t)
 
-    # ------------------------------------------------------------------
-    # 5. Call the generic expanding OOS driver
-    # ------------------------------------------------------------------
-    r2, stats, trues, preds, dates = expanding_oos_tabular(
-        df_ms,                          # month-start target series
+    
+    
+
+    return expanding_oos_tabular(
+        df,                          # month-start target series
         target_col=target_col,
-        feature_cols=[],                # no explicit tabular features; model uses y_hist internally
         start_oos=start_oos,
-        start_date=df_ms.index.min().strftime("%Y-%m-%d"),
+        start_date=start_oos,
         min_train=min_history_months,
         min_history_months=min_history_months,
         ct_cutoff=ct_cutoff,
@@ -427,8 +437,6 @@ def autoarima_oos(
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
     )
-
-    return r2, stats, trues, preds, dates
 # ================================================================
 # 5. DEEP TS MODELS – CHRONOS
 # ================================================================
@@ -444,7 +452,8 @@ def chronos_oos(
     ct_cutoff=True,
     quiet=False,
     mode = "mean",
-    model_id = "amazon/chronos-bolt-small"
+    model_id = "amazon/chronos-bolt-small",
+    ci = 0.9,
 ):
     """
     1-step-ahead Chronos-Bolt OOS evaluation using expanding_oos_tabular.
@@ -470,21 +479,24 @@ def chronos_oos(
         if len(ctx) < ctx_min:
             return None
         with torch.inference_mode():
-            _, mean_pred = pipe.predict_quantiles(
+            alpha = round((1 - ci) / 2, 2)
+            upper = 1 - alpha
+            quantiles, mean_pred = pipe.predict_quantiles(
                 inputs=[torch.tensor(ctx, device=device)],
                 prediction_length=1,
-                quantile_levels=[0.5],
+                quantile_levels=[alpha,0.5,upper],
             )
         if model_id == "amazon/chronos-2":
-            return float(mean_pred[0][0])
-        return float(mean_pred[0, 0])
+            return float(mean_pred[0][0]), quantiles
+        return float(mean_pred[0, 0]),quantiles
 
     def model_fit_predict_fn(est: pd.DataFrame, row_t: pd.Series) -> float | None:
         date_t = row_t.name
         y_hist = y.loc[:date_t].iloc[:-1]
-        return forecast_one_step(y_hist, date_t)
+        result = forecast_one_step(y_hist, date_t)
+        return [result[0],result[1][0][0][0].item(), result[1][0][0][2].item()] 
 
-    r2, stats, trues, preds, dates = expanding_oos_tabular(
+    return expanding_oos_tabular(
         y_df,
         target_col=target_col,
         feature_cols=[],  # no exogenous predictors; Chronos sees the sequence in y_hist
@@ -498,7 +510,6 @@ def chronos_oos(
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
     )
-    return r2, stats, trues, preds, dates
 # 5.2 Moirai2
 from gluonts.dataset.common import ListDataset
 from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
@@ -513,7 +524,7 @@ def moirai2_oos(
     quiet=False,
     model_name="Moirai 2 (reinstantiated each step)",
     FREQ_STR="M",
-    mode = "mean"
+    ci = 0.9,
 ):
     """
     Same as your original moirai2_oos, but using expanding_oos_tabular
@@ -595,15 +606,20 @@ def moirai2_oos(
             predictor = predictor.to(device)
         except Exception:
             pass
-
+        alpha = round((1 - ci) / 2, 2)
+        upper = 1 - alpha
         f = next(predictor.predict(ds_one))
         q_med = f.quantile(0.5)  # shape: (1,)
         fc = float(np.asarray(q_med[0], dtype="float32"))
-        return fc
+        fl = float(np.asarray(f.quantile(alpha), dtype="float32"))
+        fu = float(np.asarray(f.quantile(upper), dtype="float32"))
+        return [fc, fl, fu]
 
     # ------- 4. Use expanding_oos_tabular instead of univariate -------
     # expanding_oos_tabular returns: r2, stats, trues, preds, dates
-    r2, stats, trues, preds, dates = expanding_oos_tabular(
+    # keep old return style (no stats)
+
+    return expanding_oos_tabular(
         df,
         target_col="equity_premium",
         feature_cols=[],              # all logic is inside model_fit_predict_fn
@@ -614,12 +630,7 @@ def moirai2_oos(
         ct_cutoff=ct_cutoff,
         quiet=quiet,
         model_name=model_name,
-        model_fit_predict_fn=model_fit_predict_fn,
-        mode=mode,
-    )
-
-    # keep old return style (no stats)
-    return r2, trues, preds, dates
+        model_fit_predict_fn=model_fit_predict_fn)
 
 # ================================================================
 # 6. TABPFN (tabular, 1-step) & TABPFN-TS (multi-step)
@@ -972,7 +983,8 @@ def chronos2_oos(
     ct_cutoff=True,
     quiet=False,
     mode="mean",
-    model_id="amazon/chronos-2"
+    model_id="amazon/chronos-2",
+    ci = 0.9,
 ):
     """
     1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
@@ -1063,18 +1075,22 @@ def chronos2_oos(
         # Predict
         with torch.inference_mode():
             # Returns a LIST of tensors (one per input)
-            _, mean_pred = pipeline.predict_quantiles(
+            quantiles, mean_pred = pipeline.predict_quantiles(
                 inputs=[entry],
                 prediction_length=1,
-                quantile_levels=[0.5], 
+                quantile_levels=[(1 - ci) / 2,0.5,1 - (1 - ci) / 2], 
             )
+
             
         # Extract the scalar prediction
         # mean_pred is a list -> mean_pred[0] is the tensor -> [0, 0] is the value
-        return float(mean_pred[0][0, 0].item())
+        #return float(mean_pred[0][0, 0].item())
+        return [float(mean_pred[0][0, 0].item()), float(quantiles[0][0,0,0].item()),  float(quantiles[0][0,0,2].item())]
 
     # ------- 4. Run Expanding Loop -------
-    r2, stats, trues, preds, dates = expanding_oos_tabular(
+    
+
+    return expanding_oos_tabular(
         df, 
         target_col=target_col,
         feature_cols=[], # Logic handled inside function manually
@@ -1088,5 +1104,3 @@ def chronos2_oos(
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
     )
-
-    return r2, trues, preds, dates
