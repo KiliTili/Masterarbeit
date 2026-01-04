@@ -517,6 +517,7 @@ def moirai2_oos(
     data: pd.DataFrame,
     covariates=("d/p", "tms", "dfy"),
     start_oos="1965-01-01",
+    
     ctx=240,
     prediction_length: int = 1,
     device="cpu",
@@ -538,16 +539,10 @@ def moirai2_oos(
 
     # ------- 1. Data prep (unchanged) -------
     df = ensure_datetime_index(data)
-    df.index = df.index.to_period(FREQ_STR).to_timestamp(FREQ_STR)
-    df = df.sort_index().asfreq(FREQ_STR)
-
-    needed = ["equity_premium"] + list(covariates)
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
-    df = df[needed].dropna()
+    #df.index = df.index.to_period(FREQ_STR).to_timestamp(FREQ_STR)
+    df = df.sort_index()#.asfreq(FREQ_STR)
     y = df["equity_premium"].astype("float32")
+
     cov_df = df[list(covariates)].astype("float32")
 
     # ------- 2. Load Moirai2 (unchanged) -------
@@ -585,21 +580,29 @@ def moirai2_oos(
             "start": pd.Timestamp(y.index[start_idx]),
             "target": y_seg.astype("float32"),
         }
+        active_covs = []  #changed
+        mats = []         #changed
 
         if len(covariates) > 0:
-            mats = [cov_df[c].values[:pos] for c in covariates]
-            mats = [m[-len(y_seg):] for m in mats]
-            entry["past_feat_dynamic_real"] = np.vstack(mats).astype("float32")
-
+            seg_len = len(y_seg)
+            cov_window = cov_df.iloc[pos - seg_len : pos]
+            for c in covariates:
+                s = cov_window[c]
+                if s.notna().all():
+                    active_covs.append(c)
+                    mats.append(s.values.astype("float32").reshape(1, -1))
+        if len(mats) > 0:
+            entry["past_feat_dynamic_real"] = np.vstack(mats)
         ds_one = ListDataset([entry], freq=FREQ_STR)
-
+        effective_ctx = min(ctx, len(y_hist_full))
+        past_dim = len(mats)
         model = Moirai2Forecast(
             module=module,
             prediction_length=1,      # 1-step only
-            context_length=ctx,
+            context_length=effective_ctx,
             target_dim=1,
             feat_dynamic_real_dim=0,
-            past_feat_dynamic_real_dim=len(covariates),
+            past_feat_dynamic_real_dim=past_dim,
         )
         predictor = model.create_predictor(batch_size=2)
         try:
@@ -1103,4 +1106,134 @@ def chronos2_oos(
         model_name="Chronos-2 (w/ Covariates)",
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
+    )
+
+
+def ols_combination_oos(
+    data: pd.DataFrame,
+    variables=(),
+    target_col="equity_premium",
+    start_oos="1965-01-01",
+    start_date="1927-01-01",
+    lag=1,
+    min_train=240,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str | None = None,
+    combo: str = "mean",           # "mean", "median", "trimmed_mean", "dmspe"
+    trim_q: float = 0.1,           # for trimmed_mean: trim 10% each tail
+    dmspe_discount: float = 0.98,  # for dmspe: <1 downweights old errors; set 1.0 for MSPE
+    dmspe_eps: float = 1e-8,       # stability
+):
+    """
+    Forecast combination baseline (Rapach et al.-style):
+      - fit separate 1-predictor OLS models (expanding window)
+      - combine their 1-step-ahead forecasts each period
+
+    combo:
+      - "mean": equal-weight mean of available forecasts
+      - "median": median of available forecasts
+      - "trimmed_mean": mean after trimming trim_q from each tail
+      - "dmspe": weights ∝ 1 / (discounted MSPE) computed recursively using past OOS errors
+    """
+
+    if model_name is None:
+        model_name = f"OLS-combo({combo})[{','.join(variables)}]"
+
+    df = ensure_datetime_index(data)
+    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+
+    # create lagged features for all variables
+    df = make_lagged_features(df, variables, lag)
+
+    # map each variable -> its lagged feature columns
+    feat_map = {v: [f"{v}_lag{L}" for L in range(1, lag + 1)] for v in variables}
+    all_feature_cols = [c for cols in feat_map.values() for c in cols]
+
+    # state for DMSPE weighting (updated sequentially as expanding_oos_tabular loops forward)
+    state = {
+        "dmspe": {v: 1.0 for v in variables},   # start equal
+        "initialized": False,
+    }
+
+    def _combine_forecasts(preds_dict: dict[str, float]) -> float:
+        vals = np.array(list(preds_dict.values()), dtype=float)
+
+        if combo == "mean":
+            return float(np.mean(vals))
+
+        if combo == "median":
+            return float(np.median(vals))
+
+        if combo == "trimmed_mean":
+            if len(vals) < 3:
+                return float(np.mean(vals))
+            vals_sorted = np.sort(vals)
+            k = int(np.floor(trim_q * len(vals_sorted)))
+            if 2 * k >= len(vals_sorted):
+                return float(np.mean(vals_sorted))
+            return float(np.mean(vals_sorted[k:-k]))
+
+        if combo == "dmspe":
+            dmspe = state["dmspe"]
+            keys = list(preds_dict.keys())
+            inv = np.array([1.0 / max(dmspe[k], dmspe_eps) for k in keys], dtype=float)
+            w = inv / np.sum(inv)
+            return float(np.dot(w, np.array([preds_dict[k] for k in keys], dtype=float)))
+
+        raise ValueError(f"Unknown combo='{combo}'. Use mean/median/trimmed_mean/dmspe.")
+
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        # we will fit multiple small OLS models using only available (non-NaN) data
+        preds = {}
+
+        # must have current y_true only for updating DMSPE *after* forecasting
+        y_true = row_t.get(target_col, np.nan)
+
+        for v, cols in feat_map.items():
+            est_v = est.dropna(subset=cols + [target_col])
+            if len(est_v) < min_train:
+                continue
+            if row_t[cols].isna().any():
+                continue
+
+            X_train = est_v[cols].to_numpy(float)
+            y_train = est_v[target_col].to_numpy(float)
+            x_pred = row_t[cols].to_numpy(float).reshape(1, -1)
+
+            model = LinearRegression().fit(X_train, y_train)
+            preds[v] = float(model.predict(x_pred)[0])
+
+        if len(preds) == 0:
+            return None
+
+        # combine (weights computed from past only; DMSPE state updated after forecast)
+        y_hat = _combine_forecasts(preds)
+
+        # optional CT truncation (common in this literature)
+        if ct_cutoff and (y_hat is not None) and (not np.isnan(y_hat)):
+            y_hat = float(max(y_hat, 0.0))
+
+        # update DMSPE using *this period's realized y* (OK for next periods)
+        if combo == "dmspe" and (y_true is not None) and (not np.isnan(y_true)):
+            dmspe = state["dmspe"]
+            for v, p in preds.items():
+                err2 = float((y_true - p) ** 2)
+                dmspe[v] = dmspe_discount * dmspe[v] + err2
+
+        return y_hat
+
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=all_feature_cols,   # mostly for bookkeeping; logic is inside fit_predict
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        min_history_months=None,
+        ct_cutoff=ct_cutoff,             # (you can keep this; we also apply inside for y_hat)
+        quiet=quiet,
+        model_name=model_name,
+        model_fit_predict_fn=fit_predict,
+        mode="mean",
     )
