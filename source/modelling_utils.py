@@ -386,6 +386,104 @@ def plot_oos(
         plt.close(fig)
 
 
+def block_bootstrap_indices(T, block, rng):
+    idx = []
+    while len(idx) < T:
+        start = rng.integers(0, T)
+        idx.extend([(start + j) % T for j in range(block)])
+    return np.array(idx[:T], dtype=int)
+
+def bootstrap_cum_null_band(d, B=2000, block=12, seed=0, alpha=0.05):
+    """
+    Pointwise block-bootstrap *null/reference* band for cumulative sum of d_t
+    under the null E[d_t]=0, preserving short-run dependence via blocks.
+    """
+    rng = np.random.default_rng(seed)
+    d = np.asarray(d, dtype=float)
+    d = d[np.isfinite(d)]
+    T = len(d)
+
+    # impose null of equal average accuracy
+    d0 = d - d.mean() # To force the model to have a zero mean so the distribution is zero, basically just centering 
+
+    paths = np.empty((B, T), dtype=float)
+    for b in range(B):
+        ii = block_bootstrap_indices(T, block=block, rng=rng)
+        paths[b, :] = np.cumsum(d0[ii])
+
+    lo = np.quantile(paths, alpha/2, axis=0)
+    hi = np.quantile(paths, 1 - alpha/2, axis=0)
+    return lo, hi
+
+def plot_cum_dsse_with_bootstrap_band(
+    y_true, y_pred, y_bench,
+    dates=None,
+    title="Cumulative ΔSSE (benchmark − model)",
+    ylabel="Cumulative ΔSSE (benchmark − model)",
+    xlabel="Year",
+    add_band=True,
+    B=2000,
+    block=12,
+    seed=0,
+    band_alpha=0.20,
+    ylim=None,
+    ax=None,
+):
+    """
+    Plots S_t = Σ[(y_t-ŷ_bench,t)^2 - (y_t-ŷ_model,t)^2].
+
+    Optional shaded band: pointwise 95% circular block-bootstrap *null/reference band*
+    for S_t under E[d_t]=0 (equal average predictive accuracy), constructed by
+    resampling blocks of the centered loss differential d_t.
+    """
+    def _arr(x):
+        if isinstance(x, (pd.Series, pd.Index)):
+            x = x.to_numpy()
+        return np.asarray(x, dtype=float).reshape(-1)
+
+    y_true  = _arr(y_true)
+    y_pred  = _arr(y_pred)
+    y_bench = _arr(y_bench)
+
+    if not (len(y_true) == len(y_pred) == len(y_bench)):
+        raise ValueError("y_true, y_pred, y_bench must have the same length.")
+
+    
+    idx = pd.to_datetime(np.asarray(dates))
+    idx_is_dt = True
+
+    d = (y_true - y_bench) ** 2 - (y_true - y_pred) ** 2
+    cum = np.cumsum(d)
+
+    lower = upper = None
+    if add_band:
+        lower, upper = bootstrap_cum_null_band(d, B=B, block=block, seed=seed, alpha=0.05)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(11, 3.8))
+    else:
+        fig = ax.figure
+
+    ax.plot(idx, cum, label="cum ΔSSE")
+    ax.axhline(0.0, linewidth=1)
+
+    if add_band:
+        ax.fill_between(idx, lower, upper, alpha=band_alpha,
+                        label=f"95% block-bootstrap null band (B={B}, block={block})")
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel)
+    ax.legend(loc="best")
+
+    if idx_is_dt:
+        fig.autofmt_xdate()
+
+    return fig, ax, pd.Series(cum, index=idx, name="cum_dsse"), (lower, upper)
+
 def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure df.index is a DatetimeIndex and sorted."""
     df = df.copy()
