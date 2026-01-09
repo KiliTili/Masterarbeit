@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.abspath('../'))
 
-from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular, plot_oos
+from source.modelling_utils import ensure_datetime_index,align_monthly, expanding_oos_tabular, plot_oos,plot_cum_dsse_with_bootstrap_band
 import torch
 import random, numpy as np, torch
 
@@ -62,23 +62,22 @@ def ols_oos(
         model_name = f"OLS({','.join(variables)})"
 
     df = ensure_datetime_index(data)
-    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+#    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
     df = make_lagged_features(df, variables, lag)
 
     feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag+1)]
     from scipy.stats import norm            
 
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        est = est.dropna(subset=feature_cols + [target_col])
-        if len(est) < min_train:
-            return None
-
-        X_train = est[feature_cols].to_numpy(float)
+        valid_feature_cols = [c for c in feature_cols if est[c].notna().all()]
+        if len(valid_feature_cols) == 0:
+            raise ValueError("No valid features with complete data for OLS.")
+        
+        
+        X_train = est[valid_feature_cols].to_numpy(float)
         y_train = est[target_col].to_numpy(float)
 
-        if row_t[feature_cols].isna().any():
-            return None
-        x_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
+        x_pred = row_t[valid_feature_cols].to_numpy(float).reshape(1, -1)
 
         model = LinearRegression().fit(X_train, y_train)
         y_hat = float(model.predict(x_pred)[0])
@@ -208,7 +207,7 @@ def tree_ensemble_oos(
             return GradientBoostingRegressor(**default_params)
 
     df = ensure_datetime_index(data)
-    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+    #df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
     # lag features
     df = make_lagged_features(df, variables, lag)
