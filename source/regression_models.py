@@ -708,13 +708,11 @@ def tabpfn_oos_fit_each_step(
 
         X_train = est_train[active_cols].to_numpy(float)
         y_train = est_train[target_col].to_numpy(float)
-        
+
         X_pred = row_t[active_cols].to_numpy(float).reshape(1, -1)
 
         # only pass parameters that TabPFNRegressor actually supports
-        
         model.fit(X_train, y_train)
-
         # 1) Mean point forecast
         mean_pred = model.predict(X_pred, output_type="mean")
         fc = float(np.asarray(mean_pred).reshape(-1)[0])
