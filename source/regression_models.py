@@ -652,11 +652,15 @@ def tabpfn_oos_fit_each_step(
     model_name="TabPFN (fit each step)",
     model_params=None,
     mode="mean",
+    ci=0.90,
+    min_feat_coverage = 0.5
 ):
     """
     Tabular TabPFN: still 1-step (needs exogenous predictors).
     """
     import torch
+    from tabpfn import TabPFNRegressor
+
     try:
         from tabpfn import TabPFNRegressor
         from tabpfn.constants import ModelVersion
@@ -667,7 +671,7 @@ def tabpfn_oos_fit_each_step(
     default_params: dict = {}
     
     df = ensure_datetime_index(data)
-    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+    #df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
     if target_col not in df.columns:
         raise ValueError(f"'{target_col}' not found in data.")
@@ -681,28 +685,46 @@ def tabpfn_oos_fit_each_step(
     feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    if model_params == '2.5':
+            model = TabPFNRegressor(device=device)
+    else:
+            model = TabPFNRegressor.create_default_for_version(ModelVersion.V2,device=device)
+    alpha = (1.0 - float(ci)) / 2.0
+    q_lo, q_hi = alpha, 1.0 - alpha
     def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
-        from tabpfn import TabPFNRegressor
 
-        est_clean = est.dropna(subset=feature_cols + [target_col])
-        if len(est_clean) < min_train:
+        #est_clean = est.dropna(subset=feature_cols + [target_col])
+        coverage = est[feature_cols].notna().mean(axis=0)  # fraction per column in [0,1]
+        active_cols = [c for c in feature_cols
+                   if coverage.get(c, 0.0) >= min_feat_coverage and pd.notna(row_t.get(c, np.nan))]
+        #active_cols = feature_cols
+        if len(active_cols) == 0:
+            return None
+        print(f"{len(active_cols)/len(feature_cols)}")
+        #est_train = est.dropna(subset=active_cols)
+        est_train = est
+        if len(est_train) < min_train:
             return None
 
-        X_train = est_clean[feature_cols].to_numpy(float)
-        y_train = est_clean[target_col].to_numpy(float)
-
-        if row_t[feature_cols].isna().any():
-            return None
-        X_pred = row_t[feature_cols].to_numpy(float).reshape(1, -1)
+        X_train = est_train[active_cols].to_numpy(float)
+        y_train = est_train[target_col].to_numpy(float)
+        
+        X_pred = row_t[active_cols].to_numpy(float).reshape(1, -1)
 
         # only pass parameters that TabPFNRegressor actually supports
-        if model_params == '2.5':
-            model = TabPFNRegressor(device=device)
-        else:
-            model = TabPFNRegressor.create_default_for_version(ModelVersion.V2,device=device)
+        
         model.fit(X_train, y_train)
-        return float(model.predict(X_pred)[0])
+
+        # 1) Mean point forecast
+        mean_pred = model.predict(X_pred, output_type="mean")
+        fc = float(np.asarray(mean_pred).reshape(-1)[0])
+        # 2) Lower/upper quantiles for predictive interval
+        q_preds = model.predict(X_pred, output_type="quantiles", quantiles=[q_lo, q_hi])
+        # q_preds is a list of arrays: [q_lo_array, q_hi_array]
+        fl = float(np.asarray(q_preds[0]).reshape(-1)[0])
+        fu = float(np.asarray(q_preds[1]).reshape(-1)[0])
+        
+        return [fc,fl,fu]
 
     return expanding_oos_tabular(
         df,
