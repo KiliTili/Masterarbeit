@@ -412,7 +412,7 @@ def expanding_oos_tabular(
 
     loop_dates = df.index[df.index >= start_ts]
 
-    preds, trues, oos_dates, HA, y_lowers, y_uppers = [], [], [], [], [], []
+    preds,preds_before_ct, trues, oos_dates, HA, y_lowers, y_uppers = [], [],[], [], [], [], []
     truncated = 0
     for date_t in loop_dates:
         if not quiet:
@@ -439,7 +439,7 @@ def expanding_oos_tabular(
 
         if y_hat is None or np.isnan(y_hat):
             continue
-
+        preds_before_ct.append(float(y_hat))
         if ct_cutoff:
             if y_hat < 0:
                 truncated += 1
@@ -457,8 +457,8 @@ def expanding_oos_tabular(
     if not preds:
         raise RuntimeError(f"[{model_name}] No valid predictions produced.")
 
-    if not quiet:
-        print(f"percentage of negative forecasts before truncation: {truncated/len(preds)*100:.2f}%")
+    
+    print(f"percentage of negative forecasts before truncation: {truncated/len(preds)*100:.2f}%")
         
 
      # Manually calculate R2 for verification
@@ -467,7 +467,13 @@ def expanding_oos_tabular(
     HA = np.asarray(HA, float)
     r2_oos = 1 - np.sum((trues - preds)**2) / np.sum((trues - HA)**2)
     print(f"Manually calculated R2: {r2_oos}")
-
+    r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
+    print(f"evaluate_oos calculated R2 CT: {r2}")
+    print(f"Manually calculated Stats: {stats}")
+    r2_wct, stats_wct = evaluate_oos(trues, preds_before_ct, y_bench=HA, model_name=model_name+" (WCT)", quiet=quiet)
+    print(f"evaluate_oos calculated R2 WCT: {r2_wct}")
+    print(f"Stats WCT: {stats_wct}")
+    
     r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
     return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA
 
