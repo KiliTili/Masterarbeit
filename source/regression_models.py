@@ -653,7 +653,7 @@ def tabpfn_oos_fit_each_step(
     model_params=None,
     mode="mean",
     ci=0.90,
-    min_feat_coverage = 0.5
+    min_feat_coverage = 0.3
 ):
     """
     Tabular TabPFN: still 1-step (needs exogenous predictors).
