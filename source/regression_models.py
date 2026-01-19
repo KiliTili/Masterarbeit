@@ -70,6 +70,7 @@ def ols_oos(
     from scipy.stats import norm            
 
     def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        est = est.dropna(subset=feature_cols)
         valid_feature_cols = [c for c in feature_cols if est[c].notna().all()]
         if len(valid_feature_cols) == 0:
             raise ValueError("No valid features with complete data for OLS.")
@@ -123,13 +124,18 @@ def rank_monthly_predictors(
     """
     results = []
     for v in monthly_vars:
+        # use start data where variable is firstly not nan
+        start_date_var = data.index[data[v].notna()].min()
+        start_date_var = max(pd.Timestamp(start_date), start_date_var)
+        start_oos_var = max(pd.Timestamp(start_oos), start_date_var + pd.DateOffset(years=10)) 
+        enddate = data.index[data[v].notna()].max()
         try:
             r2,_, _, _, _,_,_,_ = ols_oos(
-                data,
+                data[(data.index >= start_date_var) &(data.index <= enddate)],
                 variables=(v,),
                 target_col="equity_premium",
-                start_oos=start_oos,
-                start_date=start_date,
+                start_oos=start_oos_var,
+                start_date=start_date_var,
                 lag=lag,
                 min_train=30,
                 ct_cutoff=ct_cutoff,
@@ -140,7 +146,7 @@ def rank_monthly_predictors(
             r2 = float("nan")
             if not quiet:
                 print(f"[WARN] {v}: {e}")
-        results.append({"variable": v, "r2_oos": r2})
+        results.append({"variable": v, "r2_oos": r2, "start_oos": start_oos_var, "start_date": start_date_var, "end_date": enddate})
 
     res_df = pd.DataFrame(results)
     sort_key = res_df["r2_oos"].fillna(-inf)
@@ -150,7 +156,7 @@ def rank_monthly_predictors(
     for i, row in res_df.iterrows():
         r2 = row["r2_oos"]
         r2_str = "NaN" if pd.isna(r2) else f"{r2:.4f}"
-        print(f"{i+1:2d}. {row['variable']:>10s}   R²_OOS = {r2_str}")
+        print(f"{i+1:2d}. {row['variable']:>10s}   R²_OOS = {r2_str} | data: {row['start_date'].date()} to {row['end_date'].date()} | OOS start: {row['start_oos'].date()}")
 
     return res_df
 
@@ -994,7 +1000,64 @@ def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def mbb_indices(
+    n: int,
+    block: int,
+    rng: np.random.Generator,
+    *,
+    anchor_end: bool = False,
+    reserve_end: bool = True,
+) -> np.ndarray:
+    """
+    Moving Block Bootstrap indices for a length-n history (0..n-1).
 
+    If anchor_end=True, the last block is forced to be [n-block, ..., n-1]
+    (i.e., directly before the target row). The remaining prefix of length
+    (n-block) is bootstrapped.
+
+    If reserve_end=True, the prefix is bootstrapped only from 0..(n-block-1),
+    so the anchored last block is not also sampled in the prefix.
+    """
+    if n <= 0:
+        return np.array([], dtype=int)
+
+    block = max(1, min(block, n))
+
+    # If the history is shorter than one block, anchoring is trivial.
+    if anchor_end and n <= block:
+        return np.arange(n, dtype=int)
+
+    def _mbb_core(n_core: int, start_max: int) -> np.ndarray:
+        """Core MBB for length n_core with block starts in [0, start_max]."""
+        if n_core <= 0:
+            return np.array([], dtype=int)
+        k = int(np.ceil(n_core / block))
+        starts = rng.integers(0, start_max + 1, size=k)
+        idx = np.concatenate([np.arange(s, s + block) for s in starts])[:n_core]
+        return idx.astype(int)
+
+    if not anchor_end:
+        # Standard MBB over full history
+        start_max = n - block
+        return _mbb_core(n_core=n, start_max=start_max)
+
+    # Anchored end block: [n-block, ..., n-1]
+    last_block = np.arange(n - block, n, dtype=int)
+
+    prefix_len = n - block
+    if prefix_len <= 0:
+        return last_block  # should not happen given earlier guards
+
+    if reserve_end:
+        # Bootstrap prefix only from 0..(prefix_len-1), with starts up to (prefix_len - block)
+        start_max = max(0, prefix_len - block)
+        prefix_idx = _mbb_core(n_core=prefix_len, start_max=start_max)
+    else:
+        # Bootstrap prefix from full history (can include indices from the final block as well)
+        start_max = n - block
+        prefix_idx = _mbb_core(n_core=prefix_len, start_max=start_max)
+
+    return np.concatenate([prefix_idx, last_block])
 def chronos2_oos(
     data: pd.DataFrame,
     covariates=("d/p", "tms", "dfy"),
@@ -1008,6 +1071,8 @@ def chronos2_oos(
     mode="mean",
     model_id="amazon/chronos-2",
     ci = 0.9,
+    bootstrap = None, #(1,12,True,True)
+    context_length = None,
 ):
     """
     1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
@@ -1025,13 +1090,11 @@ def chronos2_oos(
 
     # Sort
     df = df.sort_index()
-
     # Ensure all columns exist
     needed = [target_col] + list(covariates)
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}")
-    
     # Extract arrays for fast indexing
     y = df[target_col].astype("float32")
     cov_df = df[list(covariates)].astype("float32")
@@ -1072,22 +1135,33 @@ def chronos2_oos(
         # We need at least ctx_min history
         if pos < ctx_min:
             return None
+        if context_length:
+            target_hist = y.values[pos-context_length:pos]    
+            past_covs = {
+                col: cov_df[col].values[pos-context_length:pos] 
+                for col in covariates
+            }
+        else:
+            # 1. Target History: 0 ... t-1
+            target_hist = y.values[:pos]
+            # 2. Past Covariates: 0 ... t-1
+            past_covs = {
+                col: cov_df[col].values[:pos] 
+                for col in covariates
+            }
+        if bootstrap:
 
-        # 1. Target History: 0 ... t-1
-        target_hist = y.values[:pos]
-        # 2. Past Covariates: 0 ... t-1
-        past_covs = {
-            col: cov_df[col].values[:pos] 
-            for col in covariates
-        }
+            rng = np.random.default_rng(pos + bootstrap[0])  # seed however you like
+            L = bootstrap[1]                                    # block length (e.g., 12 for monthly)
+            boot_idx = mbb_indices(n=pos, block=L, rng=rng, anchor_end=bootstrap[2], reserve_end=bootstrap[3])
+            target_hist_star = target_hist[boot_idx]
+            past_covs_star = {col: past_covs[col][boot_idx] for col in covariates}
+            target_hist = target_hist_star
+            past_covs = past_covs_star
+        #drop na values in target_hist and past_covs
+
+
         
-        # 3. Future Covariates: t ... t (length 1)
-        # Predictors at time t are known and valid for predicting t+1
-        # future_covs = {
-        #     col: cov_df[col].values[pos:pos+1] 
-        #     for col in covariates
-        # }
-
         # Construct input dictionary
         entry = {
             "target": target_hist,
@@ -1161,7 +1235,7 @@ def ols_combination_oos(
         model_name = f"OLS-combo({combo})[{','.join(variables)}]"
 
     df = ensure_datetime_index(data)
-    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+    #df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
 
     # create lagged features for all variables
     df = make_lagged_features(df, variables, lag)
@@ -1230,9 +1304,6 @@ def ols_combination_oos(
         # combine (weights computed from past only; DMSPE state updated after forecast)
         y_hat = _combine_forecasts(preds)
 
-        # optional CT truncation (common in this literature)
-        if ct_cutoff and (y_hat is not None) and (not np.isnan(y_hat)):
-            y_hat = float(max(y_hat, 0.0))
 
         # update DMSPE using *this period's realized y* (OK for next periods)
         if combo == "dmspe" and (y_true is not None) and (not np.isnan(y_true)):
@@ -1252,6 +1323,186 @@ def ols_combination_oos(
         min_train=min_train,
         min_history_months=None,
         ct_cutoff=ct_cutoff,             # (you can keep this; we also apply inside for y_hat)
+        quiet=quiet,
+        model_name=model_name,
+        model_fit_predict_fn=fit_predict,
+        mode="mean",
+    )
+
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+
+
+def pcr_oos(
+    data: pd.DataFrame,
+    variables=(),
+    target_col: str = "equity_premium",
+    start_oos: str = "1965-01-01",
+    start_date: str = "1927-01-01",
+    lag: int = 1,
+    min_train: int = 240,
+    ct_cutoff: bool = False,
+    quiet: bool = False,
+    model_name: str | None = None,
+
+    # NEW: internal validation selection for k
+    val_frac: float = 0.2,                 # last 20% of est_clean used as validation
+    min_val: int = 60,                     # require at least this many validation obs
+    min_feat_coverage: float = 0.9,
+    k_grid: list[int] | None = None,       # candidate ks; if None, use 1..max_k
+    max_k: int = 4,                       # cap for auto grid
+):
+    """
+    PCR baseline where number of components k is selected at each origin t by
+    an internal time-series validation split within the estimation window:
+
+      - sub-train: first (1 - val_frac)
+      - validation: last val_frac
+
+    Choose k that maximizes validation R^2_OS vs Historical Average (HA),
+    then refit on full estimation window and forecast y_t.
+    """
+
+    if model_name is None:
+        model_name = f"PCR-valselect(lag={lag})[{','.join(variables)}]"
+
+    if not (0.0 < val_frac < 0.5):
+        raise ValueError("val_frac should be in (0, 0.5) for a meaningful split.")
+    if min_val <= 0:
+        raise ValueError("min_val must be positive.")
+
+    df = ensure_datetime_index(data)
+#    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+    df = make_lagged_features(df, variables, lag)
+
+    feature_cols = [f"{v}_lag{L}" for v in variables for L in range(1, lag + 1)]
+
+    def _r2_os_vs_ha(y_true: np.ndarray, y_pred: np.ndarray, ha_mean: float) -> float:
+        sse_model = float(np.sum((y_true - y_pred) ** 2))
+        sse_ha = float(np.sum((y_true - ha_mean) ** 2))
+        if not np.isfinite(sse_ha) or sse_ha <= 0.0:
+            # If y_true is constant in validation, R^2 is undefined; treat as very poor.
+            return -np.inf
+        return 1.0 - sse_model / sse_ha
+
+    def _fit_pcr_predict(
+        X_tr: np.ndarray,
+        y_tr: np.ndarray,
+        X_te: np.ndarray,
+        k: int,
+    ) -> np.ndarray:
+        """
+        Fit scaler+PCA+OLS on (X_tr, y_tr) and predict for X_te using k PCs.
+        Returns y_pred array for X_te.
+        """
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        Xs_tr = scaler.fit_transform(X_tr)
+        Xs_te = scaler.transform(X_te)
+
+        pca = PCA(n_components=None)
+        Z_tr = pca.fit_transform(Xs_tr)
+
+        k_eff = min(k, Z_tr.shape[1])
+        if k_eff <= 0:
+            raise ValueError("k_eff <= 0")
+
+        reg = LinearRegression().fit(Z_tr[:, :k_eff], y_tr)
+
+        Z_te = pca.transform(Xs_te)[:, :k_eff]
+        return reg.predict(Z_te)
+
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series) -> float | None:
+        # Feature coverage filter
+        coverage = est[feature_cols].notna().mean(axis=0)
+        valid_feature_cols = [c for c in feature_cols if coverage.get(c, 0.0) >= min_feat_coverage]
+        if len(valid_feature_cols) == 0:
+            return None
+
+        # Current row must have required predictors
+        if row_t[valid_feature_cols].isna().any():
+            return None
+
+        # Clean estimation set
+        est_clean = est.dropna(subset=valid_feature_cols + [target_col])
+        if len(est_clean) < min_train:
+            return None
+
+        n = len(est_clean)
+        n_val = int(np.floor(val_frac * n))
+        if n_val < min_val:
+            return None
+
+        n_tr = n - n_val
+        est_tr = est_clean.iloc[:n_tr]
+        est_val = est_clean.iloc[n_tr:]
+
+        X_tr = est_tr[valid_feature_cols].to_numpy(float)
+        y_tr = est_tr[target_col].to_numpy(float)
+
+        X_val = est_val[valid_feature_cols].to_numpy(float)
+        y_val = est_val[target_col].to_numpy(float)
+
+        # Candidate k grid
+        # Upper bound: rank limit (<= min(n_tr, p)) and max_k
+        p = X_tr.shape[1]
+        k_upper = min(max_k, p, n_tr)  # PCA components cannot exceed min(n_tr, p)
+        if k_upper < 1:
+            return None
+
+        if k_grid is None:
+            candidates = list(range(1, k_upper + 1))
+        else:
+            candidates = sorted({k for k in k_grid if 1 <= k <= k_upper})
+            if len(candidates) == 0:
+                return None
+
+        # HA benchmark mean from sub-train (strictly feasible)
+        ha_mean = float(np.mean(y_tr))
+
+        # Select best k by validation R^2_OS vs HA
+        best_k = None
+        best_score = -np.inf
+
+        for k in candidates:
+            try:
+                yhat_val = _fit_pcr_predict(X_tr, y_tr, X_val, k=k)
+                score = _r2_os_vs_ha(y_val, yhat_val, ha_mean=ha_mean)
+            except Exception:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_k = k
+
+        if best_k is None or not np.isfinite(best_score):
+            return None
+
+        if not quiet:
+            print(f"[PCR] {row_t.name.date()} selected k={best_k} (val R2os vs HA={best_score:.4f})")
+        best_k = 1
+        # Refit on full est_clean with best_k
+        X_full = est_clean[valid_feature_cols].to_numpy(float)
+        y_full = est_clean[target_col].to_numpy(float)
+        x_pred = row_t[valid_feature_cols].to_numpy(float).reshape(1, -1)
+
+        try:
+            yhat = _fit_pcr_predict(X_full, y_full, x_pred, k=best_k)
+        except Exception:
+            return None
+
+        return float(yhat[0])
+
+    return expanding_oos_tabular(
+        df,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        start_oos=start_oos,
+        start_date=start_date,
+        min_train=min_train,
+        min_history_months=None,
+        ct_cutoff=ct_cutoff,
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
