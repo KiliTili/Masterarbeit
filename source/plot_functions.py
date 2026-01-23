@@ -74,7 +74,7 @@ def plot_oos(
     y_upper = None,
     ci_alpha = 0.2,
     ci_label = "Prediction 90% CI",
-    events=True,
+    events=False,
 
 ):
     """
@@ -140,7 +140,7 @@ def block_bootstrap_indices(T, block, rng):
         idx.extend([(start + j) % T for j in range(block)])
     return np.array(idx[:T], dtype=int)
 
-def bootstrap_cum_null_band(d, B=2000, block=12, seed=0, alpha=0.05):
+def bootstrap_cum_band(d, B=2000, block=12, seed=0, alpha=0.05, mode="null", block_bootstrap_indices_fn=None):
     """
     Pointwise block-bootstrap *null/reference* band for cumulative sum of d_t
     under the null E[d_t]=0, preserving short-run dependence via blocks.
@@ -151,15 +151,31 @@ def bootstrap_cum_null_band(d, B=2000, block=12, seed=0, alpha=0.05):
     T = len(d)
 
     # impose null of equal average accuracy
-    d0 = d - d.mean() # To force the model to have a zero mean so the distribution is zero, basically just centering 
+    if block_bootstrap_indices_fn is None:
+        # fallback: your existing helper must exist in your code base
+        block_bootstrap_indices_fn = lambda T, block, rng: block_bootstrap_indices(T, block=block, rng=rng)
+    cum_obs = np.cumsum(d)
+    if mode == "null":
+        d_resample = d - d.mean() # To force the model to have a zero mean so the distribution is zero, basically just centering 
+    elif mode in ("delta", "tube"):
+        d_resample = d
+    else:
+        raise ValueError(f"Unknown mode '{mode}' for bootstrap_cum_band")
 
     paths = np.empty((B, T), dtype=float)
     for b in range(B):
-        ii = block_bootstrap_indices(T, block=block, rng=rng)
-        paths[b, :] = np.cumsum(d0[ii])
-
-    lo = np.quantile(paths, alpha/2, axis=0)
-    hi = np.quantile(paths, 1 - alpha/2, axis=0)
+        ii = block_bootstrap_indices_fn(T, block=block, rng=rng)
+        paths[b, :] = np.cumsum(d_resample[ii])
+    if mode == "tube":
+        mean_path = paths.mean(axis=0)
+        dev = paths - mean_path
+        lo_dev = np.quantile(dev, alpha/2, axis=0)
+        hi_dev = np.quantile(dev, 1 - alpha/2, axis=0)
+        lo = cum_obs + lo_dev
+        hi = cum_obs + hi_dev
+    else:
+        lo = np.quantile(paths, alpha/2, axis=0)
+        hi = np.quantile(paths, 1 - alpha/2, axis=0)
     return lo, hi
 
 def plot_cum_dsse_with_bootstrap_band(
@@ -175,7 +191,8 @@ def plot_cum_dsse_with_bootstrap_band(
     band_alpha=0.20,
     ylim=None,
     ax=None,
-    events = True
+    events = True,
+    mode = "null" #delta, tube
 ):
     """
     Plots S_t = Σ[(y_t-ŷ_bench,t)^2 - (y_t-ŷ_model,t)^2].
@@ -205,7 +222,7 @@ def plot_cum_dsse_with_bootstrap_band(
 
     lower = upper = None
     if add_band:
-        lower, upper = bootstrap_cum_null_band(d, B=B, block=block, seed=seed, alpha=0.05)
+        lower, upper = bootstrap_cum_band(d, B=B, block=block, seed=seed, alpha=0.05, mode = mode)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(11, 3.8))
