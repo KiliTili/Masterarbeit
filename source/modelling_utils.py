@@ -308,7 +308,7 @@ def evaluate_oos_classification(
             f"[{model_name}] Valid obs={len(y_true)} | "
             f"Acc={acc:.4f} (baseline={acc_base:.4f}) | "
             f"BalAcc={bal_acc:.4f} (baseline={bal_acc_base:.4f}) | "
-            f"Skill_Acc={skill_acc:.4f}"
+            f"SS={skill_acc:.4f}"
         )
 
     return {
