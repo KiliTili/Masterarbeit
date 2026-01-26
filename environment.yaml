@@ -29,3 +29,4 @@ dependencies:
       # Jupyter
       - ipykernel
       - jupyterlab
+      - mantis-tsfm
