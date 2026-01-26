@@ -20,7 +20,6 @@ def calc_equity_premium(df, uselog=True):
     # ret and Rfree are simple monthly returns (decimals) in this GW file
     if uselog:
         df["equity_premium"] = np.log1p(df["ret"]) - np.log1p(df["Rfree"])
-        # equivalent: np.log((1+df["ret"]) / (1+df["Rfree"]))
     else:
         df["equity_premium"] = df["ret"] - df["Rfree"]
     return df
