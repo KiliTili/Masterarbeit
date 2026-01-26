@@ -92,78 +92,111 @@ from sklearn.metrics import roc_curve
 import numpy as np
 import pandas as pd
 
-
-def make_tabpfn_lag_cls_fit_predict_fn(
+def make_tabpfn_lag_cls_fit_predict_fn_fast(
     base_cols,
-    target_col: str = "state",    # 0/1 (Bull/Bear)
+    target_col: str = "state",
     n_lags: int = 1,
-    min_train: int = 120,
-    model_params=None,            # e.g. "2.5" to mimic your reg code
+    model_params=None,
 ):
-    """
-    Create a fit_predict(est, row_t) function for TabPFN *classification*.
-
-    - Uses lagged values of multiple columns in base_cols as features.
-    - Predicts `target_col` (0/1) at time t from lags at t-1,...,t-n_lags.
-    - Training uses only past data = `est` (no look-ahead).
-    """
+    import numpy as np
+    import pandas as pd
     import torch
-    try:
-        from tabpfn import TabPFNClassifier
-        from tabpfn.constants import ModelVersion
-    except Exception as e:
-        raise RuntimeError("TabPFN not installed. Please `pip install tabpfn`.") from e
+    from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
 
     base_cols = list(base_cols)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        # Need enough history to build lags
-        if len(est) <= n_lags:
-            return np.nan
 
-        # ---------- TRAIN ON PAST ONLY ----------
-        # Build lag features on 'est' (strictly past)
-        tmp = est[list(base_cols) + [target_col]].copy()
+    if model_params == "2.5":
+        clf = TabPFNClassifier(device=device)
+    else:
+        clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, device=device)
+
+    lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
+
+    def build_lag_frame(df: pd.DataFrame) -> pd.DataFrame:
+        tmp = df[base_cols + [target_col]].copy()
         for col in base_cols:
             for k in range(1, n_lags + 1):
                 tmp[f"{col}_lag{k}"] = tmp[col].shift(k)
+        return tmp
 
-        lag_cols = [f"{col}_lag{k}" for col in base_cols for k in range(1, n_lags + 1)]
+    # ----- fallback single-step call (still works if batch path not used) -----
+    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
+        if len(est) <= n_lags:
+            return np.nan
+
+        tmp = build_lag_frame(est)
         tmp = tmp.dropna(subset=lag_cols + [target_col])
-
-        # Must have data and both classes to fit a classifier
         if tmp.empty or tmp[target_col].nunique() < 2:
             return np.nan
 
         X_train = tmp[lag_cols].to_numpy(float)
         y_train = tmp[target_col].astype(int).to_numpy()
 
-        # Choose TabPFN version
-        if model_params == "2.5":
-            clf = TabPFNClassifier(device=device)
-        else:
-            clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, device=device)
-
         clf.fit(X_train, y_train)
 
-        # ---------- PREDICT AT date_t ----------
-        # Build the feature vector for t from the last n_lags values in 'est'
-        if len(est) < n_lags:
-            return np.nan
-
+        # build x_t from last n_lags rows of est
         lag_values = []
         for col in base_cols:
-            vals = est[col].iloc[-n_lags:]  # t-1, t-2, ..., t-n
+            vals = est[col].iloc[-n_lags:]
             if vals.isna().any():
                 return np.nan
             lag_values.extend(vals.values)
 
         X_pred = np.asarray(lag_values, dtype=float).reshape(1, -1)
+        return int(clf.predict(X_pred)[0])
 
-        y_hat = clf.predict(X_pred)[0]
-        return int(y_hat)
+    # ----- fast batch method attached to the function -----
+    def batch_predict(df: pd.DataFrame, loop_dates: pd.DatetimeIndex, target_col: str, min_train: int, refit_every: int):
+        tmp = build_lag_frame(df)
 
+        # eligible OOS rows: in loop_dates, has y, has lags, enough past y
+        in_oos = tmp.index.isin(loop_dates)
+        has_y = tmp[target_col].notna()
+        has_lags = tmp[lag_cols].notna().all(axis=1)
+        past_y_count = tmp[target_col].notna().astype(int).cumsum().shift(1).fillna(0)
+        enough_train = past_y_count >= min_train
+
+        elig = in_oos & has_y & has_lags & enough_train
+        oos_dates = tmp.index[elig]
+        if len(oos_dates) == 0:
+            return [], [], []
+
+        if refit_every is None or refit_every <= 0:
+            refit_every = len(oos_dates)
+
+        trues_all, preds_all, dates_all = [], [], []
+
+        # chunk loop: fit once per chunk, predict whole chunk at once
+        y_true_full = tmp.loc[oos_dates, target_col].astype(int).to_numpy()
+
+        for start in range(0, len(oos_dates), refit_every):
+            end = min(start + refit_every, len(oos_dates))
+            chunk_dates = oos_dates[start:end]
+
+            cut_date = chunk_dates[0]
+            train_tmp = tmp.loc[tmp.index < cut_date].dropna(subset=lag_cols + [target_col])
+
+            if train_tmp.empty or train_tmp[target_col].nunique() < 2:
+                continue
+
+            X_train = train_tmp[lag_cols].to_numpy(float)
+            y_train = train_tmp[target_col].astype(int).to_numpy()
+            clf.fit(X_train, y_train)
+
+            X_pred = tmp.loc[chunk_dates, lag_cols].to_numpy(float)
+            y_hat = clf.predict(X_pred).astype(int)
+
+            trues_all.extend(y_true_full[start:end].tolist())
+            preds_all.extend(y_hat.tolist())
+            dates_all.extend(chunk_dates.tolist())
+
+        return trues_all, preds_all, dates_all
+
+    fit_predict.batch_predict = batch_predict
     return fit_predict
+
 
 
 def tabpfn_cls_oos(
@@ -177,37 +210,21 @@ def tabpfn_cls_oos(
     quiet: bool = False,
     model_name: str = "TabPFN-CLS-lag",
     baseline_mode: str = "majority",
-    model_params=None,           # e.g. "2.5"
+    model_params=None,
+    refit_every: int = 10_000_000,  # default: fit once, predict all at once
 ):
     """
-    Expanding-window 1-step-ahead OOS CLASSIFICATION with TabPFN.
-
-    - Uses lagged values of `base_cols` as features.
-    - Predicts binary `target_col` (e.g. Bull/Bear state).
-    - Re-fits TabPFNClassifier from scratch at each OOS step, like your
-      logistic baseline.
-
-    Returns
-    -------
-    metrics : dict
-        Output from evaluate_oos_classification.
-    y_true : np.ndarray
-        True labels at OOS dates.
-    y_pred : np.ndarray
-        Predicted labels at OOS dates.
-    dates : pd.DatetimeIndex
-        OOS evaluation dates.
+    Expanding-window OOS classification with TabPFN, but fast:
+    - Fits only every `refit_every` predictions (default huge => fit once)
+    - Predicts each chunk in one vectorized call
     """
-    # build the fit_predict function for TabPFN
-    fit_fn = make_tabpfn_lag_cls_fit_predict_fn(
+    fit_fn = make_tabpfn_lag_cls_fit_predict_fn_fast(
         base_cols=base_cols,
         target_col=target_col,
         n_lags=n_lags,
-        min_train=min_train,
         model_params=model_params,
     )
 
-    # plug into your generic classification OOS driver
     metrics, y_true, y_pred, dates = expanding_oos_tabular_cls(
         data=data,
         target_col=target_col,
@@ -217,13 +234,11 @@ def tabpfn_cls_oos(
         min_history_months=None,
         quiet=quiet,
         model_name=model_name,
-        model_fit_predict_fn=fit_fn,
+        model_fit_predict_fn=fit_fn,   # triggers batch fast-path
         baseline_mode=baseline_mode,
+        refit_every=refit_every,
     )
-
     return metrics, y_true, y_pred, dates
-
-
 
 from typing import Callable
 import numpy as np
@@ -1078,208 +1093,5 @@ def make_chronos_t5_cls_fit_predict_fn(
             prob_bull = probs[0, 1].item()
             
         return float(prob_bull) if return_proba else int(prob_bull >= 0.5)
-
-    return fit_predict
-
-class AugmentedMLP(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1) # Output Logits
-        )
-        
-    def forward(self, x):
-        return self.net(x)
-
-# ==========================================
-# 2. THE FACTORY FUNCTION
-# ==========================================
-def make_chronos_forecast_mlp_cls_fn(
-    feature_col: str = "equity_premium",
-    target_col: str = "state_true",
-    seq_len: int = 64,          # History length
-    pred_len: int = 12,         # How far to ask Chronos to look ahead (0 = no Chronos)
-    epochs: int = 10,
-    batch_size: int = 32,
-    lr: float = 1e-3,
-    retrain_every: int = 50,    # Retrain MLP every N steps
-    model_id: str = "amazon/chronos-bolt-small",
-    return_proba: bool = True,
-    train_window_limit: int = 300 # Only train MLP on last N samples to save time
-):
-    # ---- Device Setup ----
-    from chronos import BaseChronosPipeline          # <<< NEW (if not imported globally)
-
-    if torch.backends.mps.is_available():            # <<< CHANGED
-        device = torch.device("mps")                 # <<< CHANGED
-    elif torch.cuda.is_available():                  # <<< CHANGED
-        device = torch.device("cuda")                # <<< CHANGED
-    else:                                            # <<< CHANGED
-        device = torch.device("cpu")                 # <<< CHANGED
-
-    # ---- Persistent State ----
-    # If pred_len == 0, we will *not* use pipe at all.
-    state = {
-        "pipe": None,
-        "mlp": None,
-        "optimizer": None,
-        "loss_fn": None,
-        "feature_cache": {}, # Maps timestamp -> numpy array of features
-        "step": 0
-    }
-
-    # ---- Helper: Feature Generator (The Core Logic) ----
-    def get_augmented_features(series_window, timestamp):
-        """
-        If pred_len > 0:
-            Runs Chronos Bolt to get a forecast, then combines 
-            Past + Forecast into one feature vector.
-        If pred_len == 0:
-            Only returns normalized price path (no Chronos).
-        """
-        # Ensure numpy float array
-        series_window = np.asarray(series_window, dtype="float32")       # <<< NEW
-
-        # 1. Price path from returns
-        price_path = np.cumsum(series_window)                            # (unchanged idea)
-
-        # ------------ CASE 1: pred_len == 0  (NO CHRONOS) --------------
-        if pred_len <= 0:                                                # <<< NEW
-            combined = price_path - price_path[0]                        # <<< NEW
-            scale = np.max(np.abs(combined)) + 1e-6                      # <<< NEW
-            combined = combined / scale                                  # <<< NEW
-            return combined.astype(np.float32)                           # <<< NEW
-
-        # ------------ CASE 2: pred_len > 0 (USE CHRONOS) ---------------
-        # cache only in Chronos mode
-        if timestamp in state["feature_cache"]:                          # <<< CHANGED
-            return state["feature_cache"][timestamp]                     # <<< CHANGED
-
-        # 3. Run Chronos (Standard Public API)
-        with torch.inference_mode():
-            # context shape: [1, seq_len]
-            ctx_tensor = torch.tensor(price_path, device=device).float()
-
-            # BaseChronosPipeline.predict_quantiles returns (samples, quantiles)
-            _, quantiles = state["pipe"].predict_quantiles(              # <<< CHANGED
-                context=[ctx_tensor],                                    # <<< CHANGED
-                prediction_length=pred_len,
-                quantile_levels=[0.5],
-            )
-            # quantiles shape: (batch, pred_len)
-            forecast_values = quantiles[0, :pred_len].detach().cpu().numpy()  # <<< CHANGED
-
-        # 4. Normalize & Combine
-        combined = np.concatenate([price_path, forecast_values])
-
-        combined = combined - combined[0]
-        scale = np.max(np.abs(combined)) + 1e-6
-        combined = combined / scale
-
-        # 5. Cache and Return (only in Chronos mode)
-        state["feature_cache"][timestamp] = combined.astype(np.float32)
-        return state["feature_cache"][timestamp]
-
-
-    # ---- Main Fit/Predict ----
-    def fit_predict(est: pd.DataFrame, row_t: pd.Series):
-        state["step"] += 1
-        current_time = row_t.name # Timestamp index
-
-        # 1. Initialize models (Once)
-        if state["mlp"] is None:                                        # <<< CHANGED (check mlp, not pipe)
-            print(f"[Chronos-MLP] Initializing on {device} "
-                  f"| pred_len={pred_len} (0 => no Chronos)")           # <<< NEW
-
-            # Only load Chronos if pred_len > 0
-            if pred_len > 0:                                            # <<< NEW
-                print(f"[Chronos-MLP] Loading {model_id}...")           # <<< NEW
-                state["pipe"] = BaseChronosPipeline.from_pretrained(    # <<< NEW
-                    model_id,
-                    device_map=device,
-                    torch_dtype=torch.float32,
-                )
-
-            input_dim = seq_len + (pred_len if pred_len > 0 else 0)     # <<< NEW
-            state["mlp"] = AugmentedMLP(input_dim=input_dim).to(device)
-            state["optimizer"] = torch.optim.AdamW(state["mlp"].parameters(), lr=lr)
-            state["loss_fn"] = nn.BCEWithLogitsLoss()
-
-        # 2. Retrain MLP (Periodically)
-        if state["step"] % retrain_every == 0 or state["step"] == 1:
-            X_list = []
-            y_list = []
-
-            feats = est[feature_col].values
-            targs = est[target_col].values
-            times = est.index
-
-            if len(feats) <= seq_len:
-                return np.nan
-
-            # Backwards indices: last index down to seq_len
-            indices = range(len(feats) - 1, seq_len - 1, -1)
-            count = 0
-
-            for i in indices:
-                if count >= train_window_limit:
-                    break
-
-                w = feats[i - seq_len : i]
-                if len(w) < seq_len:
-                    continue
-
-                ts = times[i]
-                y = targs[i]
-
-                x_vec = get_augmented_features(w, ts)
-
-                X_list.append(x_vec)
-                y_list.append(y)
-                count += 1
-
-            # B. Train MLP
-            if len(X_list) > 10:
-                X_train = torch.tensor(np.stack(X_list)).float().to(device)
-                y_train = torch.tensor(np.array(y_list)).float().unsqueeze(1).to(device)
-
-                ds = TensorDataset(X_train, y_train)
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-                state["mlp"].train()
-                losses = []
-                for _ in range(epochs):
-                    for bx, by in loader:
-                        state["optimizer"].zero_grad()
-                        logits = state["mlp"](bx)
-                        loss = state["loss_fn"](logits, by)
-                        loss.backward()
-                        state["optimizer"].step()
-                        losses.append(loss.item())
-                # optional: print loss
-                # print(f"[Step {state['step']}] MLP Loss: {np.mean(losses):.4f}")
-
-        # 3. Inference (Current Step)
-        cur_series = est[feature_col].to_numpy()
-        if len(cur_series) < seq_len:
-            return np.nan
-
-        window = cur_series[-seq_len:]
-
-        x_vec = get_augmented_features(window, current_time)
-
-        state["mlp"].eval()
-        with torch.inference_mode():
-            x_tensor = torch.tensor(x_vec).float().unsqueeze(0).to(device)
-            logits = state["mlp"](x_tensor)
-            prob = torch.sigmoid(logits).item()
-
-        return float(prob) if return_proba else int(prob >= 0.5)
 
     return fit_predict

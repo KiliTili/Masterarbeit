@@ -488,19 +488,25 @@ def expanding_oos_tabular_cls(
     min_history_months: int | None = None,
     quiet: bool = False,
     model_name: str = "Logit-lag-baseline",
-    model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
-    baseline_mode: str = "majority",   # for evaluate_oos_classification
+    model_fit_predict_fn: Callable | None = None,
+    baseline_mode: str = "majority",
+    refit_every: int = 1,
 ):
     """
     Expanding-window 1-step-ahead OOS driver for CLASSIFICATION.
     Returns: (metrics_dict, y_true, y_pred, oos_dates)
+
+    Backwards compatible:
+    - If model_fit_predict_fn has no attribute `batch_predict`, we run the old per-date loop.
+    - If it *does* have `batch_predict`, we use the vectorized fast path.
     """
-    
     if model_fit_predict_fn is None:
         raise ValueError("You must supply model_fit_predict_fn.")
-    data.index = pd.to_datetime(data.timestamp, format = "%Y-%m-%d")
-    df = data.copy()
-    df = df.loc[df.index >= pd.Timestamp(start_date)].copy()
+
+    # index handling as you had it
+    data = data.copy()
+    data.index = pd.to_datetime(data.timestamp, format="%Y-%m-%d")
+    df = data.loc[pd.Timestamp(start_date):].copy()
 
     if target_col not in df.columns:
         raise ValueError(f"'{target_col}' not found in data.")
@@ -512,15 +518,40 @@ def expanding_oos_tabular_cls(
 
     loop_dates = df.index[df.index >= start_ts]
 
-    preds, trues, oos_dates = [], [], []
+    # -------------------- FAST PATH (only if provided) --------------------
+    if hasattr(model_fit_predict_fn, "batch_predict") and callable(getattr(model_fit_predict_fn, "batch_predict")):
+        trues, preds, oos_dates = model_fit_predict_fn.batch_predict(
+            df=df,
+            loop_dates=loop_dates,
+            target_col=target_col,
+            min_train=min_train,
+            refit_every=refit_every,
+        )
 
+        if len(preds) == 0:
+            raise RuntimeError(f"[{model_name}] No valid predictions produced (batch).")
+
+        trues = np.asarray(trues, int)
+        preds = np.asarray(preds, int)
+        oos_dates = pd.DatetimeIndex(oos_dates)
+
+        metrics = evaluate_oos_classification(
+            trues,
+            preds,
+            model_name=model_name,
+            baseline_mode=baseline_mode,
+            quiet=quiet,
+        )
+        return metrics, trues, preds, oos_dates
+
+    # -------------------- ORIGINAL PATH (unchanged behavior) --------------------
+    preds, trues, oos_dates = [], [], []
+    i = 0
     for date_t in loop_dates:
-        print( date_t)
         pos = df.index.get_loc(date_t)
-        est = df.iloc[:pos].copy()      # strictly past
+        est = df.iloc[:pos].copy()  # strictly past
         row_t = df.iloc[pos]
 
-        # require enough past non-missing target for a meaningful model
         if est[target_col].notna().sum() < min_train:
             continue
 
@@ -528,7 +559,13 @@ def expanding_oos_tabular_cls(
         if pd.isna(y_true):
             continue
 
-        y_hat = model_fit_predict_fn(est, row_t)
+        # preserve your legacy TabPFN hook if you want it
+        if (model_name == "TabPFN") and (i % refit_every == 0):
+            y_hat = model_fit_predict_fn(est, row_t, True)
+        else:
+            y_hat = model_fit_predict_fn(est, row_t)
+
+        i += 1
         if y_hat is None or (isinstance(y_hat, float) and np.isnan(y_hat)):
             continue
 
@@ -550,5 +587,4 @@ def expanding_oos_tabular_cls(
         baseline_mode=baseline_mode,
         quiet=quiet,
     )
-
     return metrics, trues, preds, oos_dates
