@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 import os
 sys.path.insert(0, os.path.abspath('../'))
-from source.modelling_utils import expanding_oos_tabular_cls
+from source.regression.modelling_utils import expanding_oos_tabular_cls
 import random, numpy as np, torch
 
 def set_global_seed(seed: int = 42):
