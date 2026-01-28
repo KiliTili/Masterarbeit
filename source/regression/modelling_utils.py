@@ -476,3 +476,4 @@ def expanding_oos_tabular(
     
     r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
     return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA
+

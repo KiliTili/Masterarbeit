@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 import os
-sys.path.insert(0, os.path.abspath('../'))
+sys.path.insert(0, os.path.abspath('../../'))
 from source.regression.modelling_utils import expanding_oos_tabular_cls
 import random, numpy as np, torch
 

@@ -313,16 +313,7 @@ def expanding_oos_refit_every_cls(
 
                     fitted_model = mantis_trainer
                     rf_head = rf
-            elif model == "majority":
-                y_train = df.loc[train_mask, target_col].dropna().to_numpy()
-                if len(y_train) < min_train:
-                    majority_label = None
-                    fitted_model = None
-                    continue
-                # majority class with deterministic tie-break (smallest label)
-                vals, counts = np.unique(y_train.astype(int), return_counts=True)
-                majority_label = int(vals[np.argmax(counts)])
-                fitted_model = "majority"  # marker
+
             else:
                 raise ValueError("Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head")
 
@@ -354,8 +345,7 @@ def expanding_oos_refit_every_cls(
                 Z_one = fitted_model.transform(X_one)
                 Z_one = np.asarray(Z_one, float)
                 y_hat = int(rf_head.predict(Z_one)[0])
-        elif model == "majority":
-            y_hat = majority_label
+
         y_true_list.append(int(y_true))
         y_pred_list.append(int(y_hat))
         date_list.append(date_t)
