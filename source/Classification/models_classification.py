@@ -210,6 +210,7 @@ def expanding_oos_refit_every_cls(
     seed: int = 42,
     device: str | None = None,
     quiet: bool = False,
+    max_train: int | None = None,   
 ):
     set_global_seed(seed)
 
@@ -242,6 +243,58 @@ def expanding_oos_refit_every_cls(
             device = "cpu"
 
     y_true_list, y_pred_list, date_list = [], [], []
+    if model == "tabpfn25":  #changed
+        from tabpfn import TabPFNClassifier  #changed
+
+        i = 0  #changed
+        while i < len(loop_dates):  #changed
+            date_t = loop_dates[i]  #changed
+            pos = df.index.get_loc(date_t)  #changed
+
+            train_mask = (df.index < date_t)  #changed
+            X_train_df = X_lag.loc[train_mask, feature_cols]  #changed
+            y_train_s = df.loc[train_mask, target_col]  #changed
+
+            m = X_train_df.notna().all(axis=1) & y_train_s.notna()  #changed
+            X_train = X_train_df.loc[m].to_numpy(np.float32)  #changed
+            y_train = y_train_s.loc[m].to_numpy(int)  #changed
+
+            if max_train is not None and len(y_train) > max_train:  #changed
+                X_train = X_train[-max_train:]  #changed
+                y_train = y_train[-max_train:]  #changed
+
+            if len(y_train) < min_train:  #changed
+                i += 1  #changed
+                continue  #changed
+
+            set_global_seed(seed + i)  #changed
+            model_tabpfn = TabPFNClassifier(device=device)  #changed
+            model_tabpfn.fit(X_train, y_train)  #changed
+
+            j = min(i + refit_every, len(loop_dates))  #changed
+            block_dates = loop_dates[i:j]  #changed
+
+            X_block_df = X_lag.loc[block_dates, feature_cols]  #changed
+            y_block_s = df.loc[block_dates, target_col]  #changed
+
+            ok = X_block_df.notna().all(axis=1) & y_block_s.notna()  #changed
+            if ok.any():  #changed
+                X_block = X_block_df.loc[ok].to_numpy(np.float32)  #changed
+                preds = model_tabpfn.predict(X_block).astype(int)  #changed  # (no chunking)
+                y_true_ok = y_block_s.loc[ok].to_numpy(int)  #changed
+                dates_ok = X_block_df.index[ok]  #changed
+
+                y_true_list.extend(y_true_ok.tolist())  #changed
+                y_pred_list.extend(preds.tolist())  #changed
+                date_list.extend(dates_ok.tolist())  #changed
+
+            if not quiet:  #changed
+                prev = df.index[pos - 1].date() if pos > 0 else "N/A"  #changed
+                print(f"[tabpfn25] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")  #changed
+
+            i = j  #changed
+
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)  #changed
 
     for step, date_t in enumerate(loop_dates):
         pos = df.index.get_loc(date_t)
