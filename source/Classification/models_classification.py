@@ -160,10 +160,42 @@ def build_mantis_X_one(
     X = mantis_resize_to_512(X)
     return X
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+def fit_mantis_head_frozen(mantis_trainer, X_tr, y_tr, head: str, seed: int):
+    """
+    Frozen backbone. Train only the head on top of embeddings.
+    head: "lr" or "rf"
+    """
+    Z_tr = np.asarray(mantis_trainer.transform(X_tr), float)
+
+    if head == "lr":
+        clf = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced",
+                solver="lbfgs",
+                random_state=seed,
+            )),
+        ])
+        clf.fit(Z_tr, y_tr)
+        return clf
+
+    if head == "rf":
+        rf = tune_rf_time_split(Z_tr, y_tr, seed=seed)
+        rf.fit(Z_tr, y_tr)
+        return rf
+
+    raise ValueError("head must be 'lr' or 'rf'")
 
 # -----------------------
 # Unified OOS loop with refit_every
 # -----------------------
+# ... keep your imports and everything above ...
+
 def expanding_oos_refit_every_cls(
     data: pd.DataFrame,
     *,
@@ -172,20 +204,13 @@ def expanding_oos_refit_every_cls(
     start_oos: str = "2007-01-01",
     start_date: str = "2000-01-05",
     min_train: int = 120,
-    refit_every: int = 30,              # <-- n_days (trading days)
-    model: str = "logit",               # "logit" | "rf" | "tabpfn25" | "mantis_head" | "mantis_rf_head"
-    mantis_context_len: int = 60,       # used only for mantis models
+    refit_every: int = 30,
+    model: str = "logit",  # add "majority" here too
+    mantis_context_len: int = 512,
     seed: int = 42,
     device: str | None = None,
     quiet: bool = False,
 ):
-    """
-    Predict day t using only info up to t-1.
-    Refit the model only every refit_every steps in the OOS loop (trading days).
-
-    Returns:
-      y_true (np.ndarray), y_pred (np.ndarray), oos_dates (pd.DatetimeIndex)
-    """
     set_global_seed(seed)
 
     df = ensure_datetime_index_from_timestamp(data, ts_col="timestamp")
@@ -194,23 +219,20 @@ def expanding_oos_refit_every_cls(
     start_ts = pd.Timestamp(start_oos)
     loop_dates = df.index[df.index >= start_ts]
 
-    # lag-1 tabular design for logit/rf/tabpfn
     X_lag = make_lag1_features(df, feature_cols)
     y_all = df[target_col].to_numpy()
-
-    # mantis raw features matrix for sequence building (T,C)
     feats_raw = df[feature_cols].to_numpy(dtype=float)
 
-    # models / state
     fitted_model = None
     last_fit_step = None
 
-    # for mantis: load foundation model once
+    # --- NEW state for Mantis + Majority ---
+    head_model = None          # <-- NEW: stores LR/RF head on Mantis embeddings
+    majority_label = None      # <-- NEW: stores majority class for baseline
+
     mantis_network = None
     mantis_trainer = None
-    rf_head = None
 
-    # decide device
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
@@ -222,31 +244,27 @@ def expanding_oos_refit_every_cls(
     y_true_list, y_pred_list, date_list = [], [], []
 
     for step, date_t in enumerate(loop_dates):
-        pos = df.index.get_loc(date_t)  # integer position in full df
+        pos = df.index.get_loc(date_t)
 
-        # need label at date_t
         y_true = df.loc[date_t, target_col]
         if pd.isna(y_true):
             continue
 
-        # training uses only samples with label date < date_t  (strictly past targets)
-        # for lag-1 tabular: rows < date_t already incorporate t-1 predictors via shift
         train_mask = (df.index < date_t)
 
-        # refit schedule
         need_refit = (fitted_model is None) or (last_fit_step is None) or ((step - last_fit_step) >= refit_every)
 
         if need_refit:
             set_global_seed(seed + step)
 
+            # ---------------- TABULAR MODELS ----------------
             if model in ("logit", "rf", "tabpfn25"):
                 X_train_df = X_lag.loc[train_mask, feature_cols]
-                y_train = df.loc[train_mask, target_col]
+                y_train_s = df.loc[train_mask, target_col]
 
-                # drop NaNs (from shifting) and any missing labels
-                m = X_train_df.notna().all(axis=1) & y_train.notna()
+                m = X_train_df.notna().all(axis=1) & y_train_s.notna()
                 X_train = X_train_df.loc[m].to_numpy(float)
-                y_train = y_train.loc[m].to_numpy(int)
+                y_train = y_train_s.loc[m].to_numpy(int)
 
                 if len(y_train) < min_train:
                     fitted_model = None
@@ -271,70 +289,74 @@ def expanding_oos_refit_every_cls(
 
                 elif model == "tabpfn25":
                     from tabpfn import TabPFNClassifier
-                    fitted_model = TabPFNClassifier(device=device)
+                    fitted_model = TabPFNClassifier(device=device)  # TabPFN 2.5 default
                     fitted_model.fit(X_train, y_train)
 
+                # clear mantis/majority state
+                head_model = None
+                majority_label = None
+
+            # ---------------- MANTIS (FROZEN BACKBONE + HEAD ONLY) ----------------
             elif model in ("mantis_head", "mantis_rf_head"):
                 from mantis.architecture import Mantis8M
                 from mantis.trainer import MantisTrainer
 
-                # load backbone once
                 if mantis_network is None:
                     mantis_network = Mantis8M(device=device)
                     mantis_network = mantis_network.from_pretrained("paris-noah/Mantis-8M")
 
                 mantis_trainer = MantisTrainer(device=device, network=mantis_network)
 
-                # build mantis training set using labels < date_t
-                end_pos = pos  # labels indices [0..pos-1] are allowed
-                X_tr, y_tr = build_mantis_Xy(feats_raw, y_all, end_pos=end_pos, context_len=mantis_context_len)
-
+                X_tr, y_tr = build_mantis_Xy(
+                    feats_raw, y_all, end_pos=pos, context_len=mantis_context_len
+                )
                 if X_tr is None or len(y_tr) < min_train:
                     fitted_model = None
-                    rf_head = None
+                    head_model = None
                     continue
 
+                # IMPORTANT: never call mantis_trainer.fit -> keeps backbone frozen
                 if model == "mantis_head":
-                    # fit head only (try fine_tuning_type='head', fallback to default)
-                    try:
-                        mantis_trainer.fit(X_tr, y_tr, fine_tuning_type="head")
-                    except TypeError:
-                        mantis_trainer.fit(X_tr, y_tr)
-                    fitted_model = mantis_trainer
-                    rf_head = None
+                    head_model = fit_mantis_head_frozen(
+                        mantis_trainer, X_tr, y_tr, head="lr", seed=seed + step
+                    )
+                else:
+                    head_model = fit_mantis_head_frozen(
+                        mantis_trainer, X_tr, y_tr, head="rf", seed=seed + step
+                    )
 
-                elif model == "mantis_rf_head":
-                    # extract embeddings, fit RF head with time-split tuning
-                    Z_tr = mantis_trainer.transform(X_tr)
-                    Z_tr = np.asarray(Z_tr, float)
+                fitted_model = mantis_trainer  # feature extractor only
 
-                    rf = tune_rf_time_split(Z_tr, y_tr, seed=seed + step)
-                    rf.fit(Z_tr, y_tr)
+                # clear majority state
+                majority_label = None
 
-                    fitted_model = mantis_trainer
-                    rf_head = rf
+            # ---------------- MAJORITY BASELINE ----------------
             elif model == "majority":
                 y_train = df.loc[train_mask, target_col].dropna().to_numpy()
                 if len(y_train) < min_train:
-                    majority_label = None
                     fitted_model = None
+                    majority_label = None
                     continue
-                # majority class with deterministic tie-break (smallest label)
+
                 vals, counts = np.unique(y_train.astype(int), return_counts=True)
                 majority_label = int(vals[np.argmax(counts)])
                 fitted_model = "majority"  # marker
+
+                # clear mantis head state
+                head_model = None
+
             else:
-                raise ValueError("Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head")
+                raise ValueError("Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head, majority")
 
             last_fit_step = step
             if not quiet:
-                print(f"[{model}] refit at {date_t.date()} using data up to {df.index[pos-1].date() if pos>0 else 'N/A'}")
+                prev = df.index[pos-1].date() if pos > 0 else "N/A"
+                print(f"[{model}] refit at {date_t.date()} using data up to {prev}")
 
-        # if we couldn't fit, skip
         if fitted_model is None:
             continue
 
-        # -------- predict for date_t (using info up to t-1) --------
+        # ---------------- PREDICT ----------------
         if model in ("logit", "rf", "tabpfn25"):
             x_row = X_lag.loc[date_t, feature_cols]
             if x_row.isna().any():
@@ -346,16 +368,19 @@ def expanding_oos_refit_every_cls(
             X_one = build_mantis_X_one(feats_raw, pos=pos, context_len=mantis_context_len)
             if X_one is None:
                 continue
+            if head_model is None:
+                continue
+            Z_one = np.asarray(fitted_model.transform(X_one), float)
+            y_hat = int(head_model.predict(Z_one)[0])
 
-            if model == "mantis_head":
-                y_hat = int(fitted_model.predict(X_one)[0])
-
-            else:
-                Z_one = fitted_model.transform(X_one)
-                Z_one = np.asarray(Z_one, float)
-                y_hat = int(rf_head.predict(Z_one)[0])
         elif model == "majority":
-            y_hat = majority_label
+            if majority_label is None:
+                continue
+            y_hat = int(majority_label)
+
+        else:
+            raise RuntimeError("Internal: unknown model at prediction stage.")
+
         y_true_list.append(int(y_true))
         y_pred_list.append(int(y_hat))
         date_list.append(date_t)
