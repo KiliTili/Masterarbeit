@@ -222,6 +222,7 @@ def bootstrap_refit_train_test(
     *,
     target_col: str,
     feature_cols: list[str],
+    start_data: str = "1927-01-01",
     start_oos: str,
     min_train: int = 240,
     B: int = 1000,
@@ -234,9 +235,12 @@ def bootstrap_refit_train_test(
     trim_q: float = 0.1,
     ct_cutoff: bool = True,
     auto_arima_kwargs: dict | None = None,
+    y_pred_given: list[float] | None = None,
 ):
     df = ensure_datetime_index(df).copy()
+
     df = df[df.index >= start_oos]
+    df_additional = df[(df.index < start_oos) & (df.index >= start_data)]
     # Bootstrap distribution
     boot_r2 = np.empty(B, float)
     n_train = len(df)
@@ -292,7 +296,8 @@ def bootstrap_refit_train_test(
         #ha_test = ha.loc[df_test.index].to_numpy(float) 
         #print prersentage of observations in df_test
         print(f"Bootstrap {b+1}/{B}: df_test has {len(df_test)}/{len(df)} observations ({len(df_test)/len(df)*100:.2f}%)")
-
+        #concatanate train_star with df_additional
+        train_star = pd.concat([df_additional, train_star]).sort_index()
         if model == "autoarima":
             ytr = train_star[target_col].to_numpy(float)
             yhat = autoarima_fit_predict_batch(ytr, n_test=len(df_test), seed=seed + b, auto_arima_kwargs=auto_arima_kwargs)
@@ -330,7 +335,9 @@ def bootstrap_refit_train_test(
                 else:  #changed
                     P = np.vstack(preds)  #changed
                     yhat = _combine_preds(P, combo, trim_q)  #changed
-
+        elif (model == "chronos_2") or (model == "moirai_2"): 
+            y_hat = y_pred_given[~df.index.isin(train_star.index)]
+            yhat = np.asarray(y_hat, float)
         if ct_cutoff:
             yhat = np.maximum(yhat, 0.0)
         # scale ha to length of y_test
@@ -340,86 +347,3 @@ def bootstrap_refit_train_test(
     stats = summarize_bootstrap(boot_r2, ci=0.90)
     return  stats
 
-
-def bootstrap_refit_combo(
-    df: pd.DataFrame,
-    *,
-    target_col: str,
-    start_oos: str,
-    variables: list[str],
-    lag: int = 1,
-    min_train: int = 240,
-    B: int = 1000,
-    seed: int = 42,
-    bootstrap: str = "iid",
-    block_size: int = 12,
-    combo: str = "mean",
-    trim_q: float = 0.1,
-    ct_cutoff: bool = False,
-):
-    df = ensure_datetime_index(df).copy()
-    df = make_lagged_features(df, variables, lag)
-
-    feat_map = {v: [f"{v}_lag{L}" for L in range(1, lag + 1)] for v in variables}
-    all_cols = [c for cols in feat_map.values() for c in cols]
-
-    ha = build_benchmark_HA(df, target_col)
-
-    start_oos_ts = pd.Timestamp(start_oos)
-    train_mask = df.index < start_oos_ts
-    test_mask  = df.index >= start_oos_ts
-
-    # require y + each var's lags
-    train_valid = train_mask & df[target_col].notna()
-    for c in all_cols:
-        train_valid &= df[c].notna()
-
-    test_valid = test_mask & df[target_col].notna() & ha.notna()
-    for c in all_cols:
-        test_valid &= df[c].notna()
-
-    df_train = df.loc[train_valid].copy()
-    df_test  = df.loc[test_valid].copy()
-
-    if len(df_train) < min_train:
-        raise ValueError(f"Not enough training data after filtering: {len(df_train)} < {min_train}")
-
-    y_test = df_test[target_col].to_numpy(float)
-    ha_test = ha.loc[df_test.index].to_numpy(float)
-
-    # point estimate
-    X_train_dict0 = {v: df_train[feat_map[v]].to_numpy(float) for v in variables}
-    X_test_dict0  = {v: df_test[feat_map[v]].to_numpy(float)  for v in variables}
-    y_train0 = df_train[target_col].to_numpy(float)
-
-    yhat0 = combo_ols_fit_predict_batch(X_train_dict0, y_train0, X_test_dict0, combo=combo, trim_q=trim_q)
-    if ct_cutoff:
-        yhat0 = np.maximum(yhat0, 0.0)
-    r2_point = r2_oos_vs_bench(y_test, yhat0, ha_test)
-
-    # bootstrap
-    boot_r2 = np.empty(B, float)
-    n_train = len(df_train)
-
-    for b in range(B):
-        rng = np.random.default_rng(seed + b)
-        if bootstrap == "iid":
-            idx = bootstrap_indices_iid(n_train, rng)
-        elif bootstrap == "mbb":
-            idx = bootstrap_indices_mbb(n_train, block_size, rng)
-        else:
-            raise ValueError("bootstrap must be 'iid' or 'mbb'")
-
-        train_star = df_train.iloc[idx].copy()
-
-        X_train_dict = {v: train_star[feat_map[v]].to_numpy(float) for v in variables}
-        y_train = train_star[target_col].to_numpy(float)
-
-        yhat = combo_ols_fit_predict_batch(X_train_dict, y_train, X_test_dict0, combo=combo, trim_q=trim_q)
-        if ct_cutoff:
-            yhat = np.maximum(yhat, 0.0)
-
-        boot_r2[b] = r2_oos_vs_bench(y_test, yhat, ha_test)
-
-    stats = summarize_bootstrap(boot_r2, ci=0.90)
-    return r2_point, stats
