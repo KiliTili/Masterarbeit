@@ -7,7 +7,7 @@ dependencies:
   - pip
   - pip:
       # Core HF + utils
-      - transformers>=4.44
+      - transformers==4.41.2
       - accelerate>=0.33
       - huggingface_hub>=0.24
       - datasets>=2.20
