@@ -228,7 +228,7 @@ def expanding_oos_refit_every_cls(
     idx_map = pd.Series(np.arange(len(df.index)), index=df.index)
     loop_pos = idx_map.loc[loop_dates].to_numpy(dtype=int)
 
-    y_true_list, y_pred_list, date_list = [], [], []
+    y_true_list, y_pred_list,y_prob, date_list =     [], [], [], []
 
     # -----------------------
     # CPU models: block worker (optionally parallel)
@@ -295,13 +295,16 @@ def expanding_oos_refit_every_cls(
 
         if model == "majority":
             preds = np.full(ok.sum(), fitted, dtype=int)
+            prob = np.full(ok.sum(), 1.0 if fitted == 1 else 0.0, dtype=float)
         else:
-            preds = fitted.predict(X_blk[ok]).astype(int)
+            e = fitted.predict(X_blk[ok])
+            preds = fitted.predict(X_blk[ok])
+            prob = fitted.predict_proba(X_blk[ok])[:, 1]
 
         dates_ok = df.index[block_pos][ok].to_numpy(dtype="datetime64[ns]")
         y_true_ok = y_blk[ok].astype(int)
 
-        return (y_true_ok, preds, dates_ok, (date_t, pos0, j - i))
+        return (y_true_ok, preds, prob, dates_ok, (date_t, pos0, j - i))
 
     # -----------------------
     # TABULAR CPU models (logit/rf/majority): blocked + optional parallel
@@ -318,11 +321,12 @@ def expanding_oos_refit_every_cls(
             results = [_fit_predict_block_cpu(bi) for bi in block_starts]
 
         # stitch (already in chronological order)
-        for (yt, yp, dt, info) in results:
+        for (yt, yp,prob, dt, info) in results:
             if len(yt) == 0:
                 continue
             y_true_list.extend(yt.tolist())
             y_pred_list.extend(yp.tolist())
+            y_prob.extend(prob.tolist())
             date_list.extend(dt.tolist())
 
             if (not quiet) and info is not None:
@@ -330,7 +334,7 @@ def expanding_oos_refit_every_cls(
                 prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
                 
 
-        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int),np.asarray(y_prob, float), pd.DatetimeIndex(date_list)
 
     # -----------------------
     # TabPFN (GPU/Metal/CPU): blocked sequential
@@ -368,12 +372,15 @@ def expanding_oos_refit_every_cls(
 
             ok = np.isfinite(X_blk).all(axis=1) & np.isfinite(y_blk)
             if ok.any():
-                preds = clf.predict(X_blk[ok]).astype(int)
+                e = clf.predict(X_blk[ok])
+                preds = e.astype(int)
+                probas = e[:, 1]
                 dates_ok = df.index[block_pos][ok]
                 y_true_ok = y_blk[ok].astype(int)
 
                 y_true_list.extend(y_true_ok.tolist())
                 y_pred_list.extend(preds.tolist())
+                y_prob.extend(probas.tolist())
                 date_list.extend(dates_ok.tolist())
 
             if not quiet:
@@ -382,7 +389,7 @@ def expanding_oos_refit_every_cls(
 
             i = j
 
-        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int),np.asarray(y_prob, float),  pd.DatetimeIndex(date_list)
 
     # -----------------------
     # Mantis (frozen backbone + head): blocked, with optional embedding cache
@@ -457,6 +464,7 @@ def expanding_oos_refit_every_cls(
 
                 if m_blk.any():
                     Z_blk = Z_all[block_pos][m_blk]
+                    prob = head_model.predict_proba(Z_blk)[:, 1]
                     preds = head_model.predict(Z_blk).astype(int)
 
                     dates_ok = df.index[block_pos][m_blk]
@@ -465,6 +473,7 @@ def expanding_oos_refit_every_cls(
                     y_true_list.extend(y_true_ok.tolist())
                     y_pred_list.extend(preds.tolist())
                     date_list.extend(dates_ok.tolist())
+                    y_prob.extend(prob.tolist())
 
                 if not quiet:
                     prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
@@ -530,7 +539,7 @@ def expanding_oos_refit_every_cls(
 
                 i = j
 
-        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), np.asarray(y_prob, float), pd.DatetimeIndex(date_list)
 
     raise ValueError(
         "Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head, majority"
