@@ -1,14 +1,12 @@
 import numpy as np
 import pandas as pd
+import random
+import torch
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import balanced_accuracy_score
-
-import random
-import torch
 
 
 # -----------------------
@@ -35,97 +33,30 @@ def ensure_datetime_index_from_timestamp(df: pd.DataFrame, ts_col: str = "timest
     df = df.set_index(ts_col)
     return df
 
+
 def make_lag1_features(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    X = df[feature_cols].shift(1)  # X_t uses info up to t-1
-    return X
-
-def time_split_last20(X, y):
-    n = len(y)
-    if n < 5:
-        return None
-    cut = int(np.floor(0.8 * n))
-    if cut < 1 or cut >= n:
-        return None
-    return X[:cut], y[:cut], X[cut:], y[cut:]
+    # X_t uses info up to t-1
+    return df[feature_cols].shift(1)
 
 
 # -----------------------
-# RandomForest tuning (time split last 20%)
+# RF helper (simple + fast)
 # -----------------------
-def tune_rf_time_split(X_train: np.ndarray, y_train: np.ndarray, seed: int = 42):
-    split = time_split_last20(X_train, y_train)
-    if split is None:
-        # fallback
-        return RandomForestClassifier(
-            n_estimators=400,
-            random_state=seed,
-            n_jobs=-1,
-            class_weight="balanced_subsample"
-        )
-
-    Xtr, ytr, Xval, yval = split
-
-    grid = {
-        "n_estimators": [200, 500],
-        "max_depth": [None, 3, 6],
-        "min_samples_leaf": [1, 5],
-        "max_features": ["sqrt", None],
-    }
-    grid = {
-        "n_estimators": [200],
-        "max_depth": [None],
-        "min_samples_leaf": [1, 5],
-        "max_features": ["sqrt"],
-    }
-    best = None
-    best_score = -np.inf
-    refit = RandomForestClassifier(
+def make_default_rf(seed: int = 42, n_jobs: int = -1):
+    # Your tune_rf_time_split had dead/unreachable code; keeping a solid default.
+    return RandomForestClassifier(
         n_estimators=200,
         max_depth=None,
         min_samples_leaf=5,
         max_features="sqrt",
         random_state=seed,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         class_weight="balanced_subsample",
     )
-    return refit
-    for n_estimators in grid["n_estimators"]:
-        for max_depth in grid["max_depth"]:
-            for min_samples_leaf in grid["min_samples_leaf"]:
-                for max_features in grid["max_features"]:
-                    m = RandomForestClassifier(
-                        n_estimators=n_estimators,
-                        max_depth=max_depth,
-                        min_samples_leaf=min_samples_leaf,
-                        max_features=max_features,
-                        random_state=seed,
-                        n_jobs=-1,
-                        class_weight="balanced_subsample",
-                    )
-                    m.fit(Xtr, ytr)
-                    pred = m.predict(Xval)
-                    score = balanced_accuracy_score(yval, pred)
-                    if score > best_score:
-                        best_score = score
-                        best = m
-
-    # Refit best hyperparams on FULL train
-    params = best.get_params()
-    print(params)
-    refit = RandomForestClassifier(
-        n_estimators=params["n_estimators"],
-        max_depth=params["max_depth"],
-        min_samples_leaf=params["min_samples_leaf"],
-        max_features=params["max_features"],
-        random_state=seed,
-        n_jobs=-1,
-        class_weight="balanced_subsample",
-    )
-    return refit
 
 
 # -----------------------
-# Mantis data builder: sequence up to t-1 (no look-ahead)
+# Mantis data builder (no look-ahead)
 # -----------------------
 def mantis_resize_to_512(X: np.ndarray) -> np.ndarray:
     """
@@ -137,54 +68,82 @@ def mantis_resize_to_512(X: np.ndarray) -> np.ndarray:
     Xt = F.interpolate(Xt, size=512, mode="linear", align_corners=False)
     return Xt.cpu().numpy()
 
-def build_mantis_Xy(
-    feats: np.ndarray,  # shape (T, C)
-    y: np.ndarray,      # shape (T,)
-    end_pos: int,       # build samples with label positions i in [context_len, end_pos)
+
+def build_mantis_X_block(
+    feats: np.ndarray,          # (T, C)
+    positions: np.ndarray,      # positions p where we want X from feats[p-context_len:p]
     context_len: int,
 ):
     """
-    Sample i corresponds to predicting y[i] using feats[i-context_len : i] (history up to i-1).
-    Returns X (N,C,L) and y (N,).
+    Returns:
+      X: (N, C, 512) float32
+      ok_positions: (N,) int positions that were valid
     """
-    X_list, y_list = [], []
-    for i in range(context_len, end_pos):
-        window = feats[i - context_len:i]  # (L,C)
-        if not np.isfinite(window).all():
+    X_list = []
+    ok_pos = []
+    for p in positions.tolist():
+        if p < context_len:
             continue
-        X_list.append(window.T)  # (C,L)
-        y_list.append(y[i])
+        w = feats[p - context_len:p]  # (L, C)
+        if not np.isfinite(w).all():
+            continue
+        X_list.append(w.T)  # (C, L)
+        ok_pos.append(p)
+
     if len(X_list) == 0:
         return None, None
-    X = np.stack(X_list, axis=0).astype(np.float32)  # (N,C,L)
-    y_out = np.asarray(y_list, dtype=int)
-    X = mantis_resize_to_512(X)
-    return X, y_out
 
-def build_mantis_X_one(
-    feats: np.ndarray,  # (T,C)
-    pos: int,           # predict y[pos] using feats[pos-context_len:pos]
+    X = np.stack(X_list, axis=0).astype(np.float32)  # (N, C, L)
+    X = mantis_resize_to_512(X)  # (N, C, 512)
+    return X, np.asarray(ok_pos, dtype=int)
+
+
+def precompute_mantis_embeddings(
+    mantis_trainer,
+    feats_raw: np.ndarray,      # (T, C)
     context_len: int,
+    chunk_size: int = 256,
 ):
-    if pos < context_len:
-        return None
-    window = feats[pos - context_len:pos]  # (L,C)
-    if not np.isfinite(window).all():
-        return None
-    X = window.T[None, ...].astype(np.float32)  # (1,C,L)
-    X = mantis_resize_to_512(X)
-    return X
+    """
+    Precompute frozen-backbone embeddings Z[p] for all valid positions p >= context_len.
+    Returns:
+      Z_all: (T, D) float32 with NaN rows for invalid/uncomputed positions
+      ok_embed: (T,) bool whether Z_all[p] is valid
+    """
+    T = feats_raw.shape[0]
+    Z_all = None
+    ok_embed = np.zeros(T, dtype=bool)
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
+    positions = np.arange(context_len, T, dtype=int)
+
+    for s in range(0, len(positions), chunk_size):
+        pos_chunk = positions[s:s + chunk_size]
+        X_chunk, ok_pos = build_mantis_X_block(feats_raw, pos_chunk, context_len=context_len)
+        if X_chunk is None:
+            continue
+
+        Z_chunk = np.asarray(mantis_trainer.transform(X_chunk), dtype=np.float32)  # (N, D)
+
+        if Z_all is None:
+            D = Z_chunk.shape[1]
+            Z_all = np.full((T, D), np.nan, dtype=np.float32)
+
+        Z_all[ok_pos] = Z_chunk
+        ok_embed[ok_pos] = True
+
+    if Z_all is None:
+        # no valid windows
+        Z_all = np.full((T, 1), np.nan, dtype=np.float32)
+
+    return Z_all, ok_embed
+
 
 def fit_mantis_head_frozen(mantis_trainer, X_tr, y_tr, head: str, seed: int):
     """
     Frozen backbone. Train only the head on top of embeddings.
     head: "lr" or "rf"
     """
-    Z_tr = np.asarray(mantis_trainer.transform(X_tr), float)
+    Z_tr = np.asarray(mantis_trainer.transform(X_tr), dtype=np.float32)
 
     if head == "lr":
         clf = Pipeline([
@@ -200,17 +159,16 @@ def fit_mantis_head_frozen(mantis_trainer, X_tr, y_tr, head: str, seed: int):
         return clf
 
     if head == "rf":
-        rf = tune_rf_time_split(Z_tr, y_tr, seed=seed)
+        rf = make_default_rf(seed=seed, n_jobs=-1)
         rf.fit(Z_tr, y_tr)
         return rf
 
     raise ValueError("head must be 'lr' or 'rf'")
 
-# -----------------------
-# Unified OOS loop with refit_every
-# -----------------------
-# ... keep your imports and everything above ...
 
+# -----------------------
+# Main: expanding OOS with block refits (FAST)
+# -----------------------
 def expanding_oos_refit_every_cls(
     data: pd.DataFrame,
     *,
@@ -220,14 +178,25 @@ def expanding_oos_refit_every_cls(
     start_date: str = "2000-01-05",
     min_train: int = 120,
     refit_every: int = 30,
-    model: str = "logit",  # add "majority" here too
+    model: str = "logit",  # "logit", "rf", "tabpfn25", "mantis_head", "mantis_rf_head", "majority"
     mantis_context_len: int = 512,
     seed: int = 42,
     device: str | None = None,
     quiet: bool = False,
-    max_train: int | None = None,   
-    mantis_max_train_windows: int | None = None, 
+    max_train: int | None = None,
+    mantis_max_train_windows: int | None = None,
+    # new speed knobs:
+    parallel_blocks: bool = False,     # only used for CPU models: logit/rf/majority
+    n_jobs_outer: int = -1,            # joblib Parallel workers
+    mantis_cache_embeddings: bool = True,
+    mantis_embed_chunk: int = 256,
 ):
+    """
+    Fast version:
+      - predicts in blocks for ALL models
+      - for Mantis frozen backbone: optionally cache all embeddings once, then head trains/predicts from slices
+      - optional block parallelism for CPU models (logit/rf/majority). If enabled, RF uses n_jobs=1 to avoid nested parallelism.
+    """
     set_global_seed(seed)
 
     df = ensure_datetime_index_from_timestamp(data, ts_col="timestamp")
@@ -235,21 +204,10 @@ def expanding_oos_refit_every_cls(
 
     start_ts = pd.Timestamp(start_oos)
     loop_dates = df.index[df.index >= start_ts]
+    if len(loop_dates) == 0:
+        return np.asarray([], int), np.asarray([], int), pd.DatetimeIndex([])
 
-    X_lag = make_lag1_features(df, feature_cols)
-    y_all = df[target_col].to_numpy()
-    feats_raw = df[feature_cols].to_numpy(dtype=float)
-
-    fitted_model = None
-    last_fit_step = None
-
-    # --- NEW state for Mantis + Majority ---
-    head_model = None          # <-- NEW: stores LR/RF head on Mantis embeddings
-    majority_label = None      # <-- NEW: stores majority class for baseline
-
-    mantis_network = None
-    mantis_trainer = None
-
+    # pick device
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
@@ -258,291 +216,322 @@ def expanding_oos_refit_every_cls(
         else:
             device = "cpu"
 
+    # lagged features (no look-ahead)
+    X_lag = make_lag1_features(df, feature_cols)
+
+    # numpy versions for speed
+    X_lag_np = X_lag[feature_cols].to_numpy(dtype=np.float32)          # (T, F) with NaN
+    y_np = df[target_col].to_numpy(dtype=float)                        # (T,) with NaN possible
+    feats_raw = df[feature_cols].to_numpy(dtype=float)                 # (T, F) raw feats for Mantis windows
+
+    # map timestamps -> integer positions once (avoid get_loc in loops)
+    idx_map = pd.Series(np.arange(len(df.index)), index=df.index)
+    loop_pos = idx_map.loc[loop_dates].to_numpy(dtype=int)
+
     y_true_list, y_pred_list, date_list = [], [], []
-    if model in ("mantis_head", "mantis_rf_head"):  #changed
-        from mantis.architecture import Mantis8M  #changed
-        from mantis.trainer import MantisTrainer  #changed
 
-        if device is None:  #changed
-            if torch.cuda.is_available():  #changed
-                device = "cuda"  #changed
-            elif torch.backends.mps.is_available():  #changed
-                device = "mps"  #changed
-            else:  #changed
-                device = "cpu"  #changed
+    # -----------------------
+    # CPU models: block worker (optionally parallel)
+    # -----------------------
+    def _fit_predict_block_cpu(block_start_i: int):
+        # This function is pure CPU; safe for joblib parallel.
+        i = block_start_i
+        pos0 = loop_pos[i]
+        date_t = loop_dates[i]
 
-        # load backbone once  #changed
-        mantis_network = Mantis8M(device=device)  #changed
-        mantis_network = mantis_network.from_pretrained("paris-noah/Mantis-8M")  #changed
-        mantis_trainer = MantisTrainer(device=device, network=mantis_network)  #changed
+        # training strictly before pos0
+        X_train = X_lag_np[:pos0]
+        y_train = y_np[:pos0]
 
-        def build_mantis_X_block(feats: np.ndarray, positions: list[int], context_len: int):  #changed
-            X_list = []  #changed
-            ok_pos = []  #changed
-            for p in positions:  #changed
-                if p < context_len:  #changed
-                    continue  #changed
-                w = feats[p - context_len:p]  #changed
-                if not np.isfinite(w).all():  #changed
-                    continue  #changed
-                X_list.append(w.T)  #changed  # (C,L)
-                ok_pos.append(p)  #changed
-            if len(X_list) == 0:  #changed
-                return None, None  #changed
-            X = np.stack(X_list, axis=0).astype(np.float32)  #changed  # (N,C,L)
-            X = mantis_resize_to_512(X)  #changed
-            return X, ok_pos  #changed
+        m = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+        X_train = X_train[m]
+        y_train = y_train[m].astype(int)
 
-        i = 0  #changed
-        while i < len(loop_dates):  #changed
-            date_t = loop_dates[i]  #changed
-            pos0 = df.index.get_loc(date_t)  #changed
+        if max_train is not None and len(y_train) > max_train:
+            X_train = X_train[-max_train:]
+            y_train = y_train[-max_train:]
 
-            # ---- TRAINING (strictly past labels) ----  #changed
-            X_tr, y_tr = build_mantis_Xy(  #changed
-                feats_raw, y_all, end_pos=pos0, context_len=mantis_context_len  #changed
-            )  #changed
+        if len(y_train) < min_train:
+            return (np.asarray([], int), np.asarray([], int), np.asarray([], "datetime64[ns]"), None)
 
-            if X_tr is None or len(y_tr) < min_train:  #changed
-                i += 1  #changed
-                continue  #changed
+        # fit
+        set_global_seed(seed + i)
 
-            if mantis_max_train_windows is not None and len(y_tr) > mantis_max_train_windows:  #changed
-                X_tr = X_tr[-mantis_max_train_windows:]  #changed
-                y_tr = y_tr[-mantis_max_train_windows:]  #changed
+        if model == "logit":
+            fitted = Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf", LogisticRegression(
+                    max_iter=2000,
+                    class_weight="balanced",
+                    solver="lbfgs",
+                    random_state=seed + i,
+                )),
+            ])
+            fitted.fit(X_train, y_train)
 
-            set_global_seed(seed + i)  #changed
+        elif model == "rf":
+            # avoid nested parallelism if we parallelize blocks outside
+            rf_n_jobs = 1 if parallel_blocks else -1
+            fitted = make_default_rf(seed=seed + i, n_jobs=rf_n_jobs)
+            fitted.fit(X_train, y_train)
 
-            # fit ONLY head (backbone frozen via transform inside helper)  #changed
-            if model == "mantis_head":  #changed
-                head_model = fit_mantis_head_frozen(  #changed
-                    mantis_trainer, X_tr, y_tr, head="lr", seed=seed + i  #changed
-                )  #changed
-            else:  #changed
-                head_model = fit_mantis_head_frozen(  #changed
-                    mantis_trainer, X_tr, y_tr, head="rf", seed=seed + i  #changed
-                )  #changed
+        elif model == "majority":
+            vals, counts = np.unique(y_train, return_counts=True)
+            maj = int(vals[np.argmax(counts)])
+            fitted = maj
 
-            # ---- PREDICT BLOCK ----  #changed
-            j = min(i + refit_every, len(loop_dates))  #changed
-            block_dates = loop_dates[i:j]  #changed
-            block_positions = [df.index.get_loc(d) for d in block_dates]  #changed
+        else:
+            raise ValueError("CPU worker called with non-CPU model")
 
-            X_blk, ok_positions = build_mantis_X_block(  #changed
-                feats_raw, block_positions, context_len=mantis_context_len  #changed
-            )  #changed
-            if X_blk is not None:  #changed
-                Z_blk = np.asarray(mantis_trainer.transform(X_blk), float)  #changed
-                preds = head_model.predict(Z_blk).astype(int)  #changed
+        # predict block
+        j = min(i + refit_every, len(loop_dates))
+        block_pos = loop_pos[i:j]
+        X_blk = X_lag_np[block_pos]
+        y_blk = y_np[block_pos]
 
-                # map ok_positions back to dates  #changed
-                ok_dates = [df.index[p] for p in ok_positions]  #changed
-                y_true_blk = df.loc[ok_dates, target_col].to_numpy(int)  #changed
+        ok = np.isfinite(X_blk).all(axis=1) & np.isfinite(y_blk)
+        if not ok.any():
+            return (np.asarray([], int), np.asarray([], int), np.asarray([], "datetime64[ns]"), (date_t, pos0, j - i))
 
-                y_true_list.extend(y_true_blk.tolist())  #changed
-                y_pred_list.extend(preds.tolist())  #changed
-                date_list.extend(ok_dates)  #changed
+        if model == "majority":
+            preds = np.full(ok.sum(), fitted, dtype=int)
+        else:
+            preds = fitted.predict(X_blk[ok]).astype(int)
 
-            if not quiet:  #changed
-                prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"  #changed
-                print(f"[{model}] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")  #changed
+        dates_ok = df.index[block_pos][ok].to_numpy(dtype="datetime64[ns]")
+        y_true_ok = y_blk[ok].astype(int)
 
-            i = j  #changed
+        return (y_true_ok, preds, dates_ok, (date_t, pos0, j - i))
+
+    # -----------------------
+    # TABULAR CPU models (logit/rf/majority): blocked + optional parallel
+    # -----------------------
+    if model in ("logit", "rf", "majority"):
+        block_starts = list(range(0, len(loop_dates), refit_every))
+
+        if parallel_blocks and len(block_starts) > 1:
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=n_jobs_outer, backend="loky")(
+                delayed(_fit_predict_block_cpu)(bi) for bi in block_starts
+            )
+        else:
+            results = [_fit_predict_block_cpu(bi) for bi in block_starts]
+
+        # stitch (already in chronological order)
+        for (yt, yp, dt, info) in results:
+            if len(yt) == 0:
+                continue
+            y_true_list.extend(yt.tolist())
+            y_pred_list.extend(yp.tolist())
+            date_list.extend(dt.tolist())
+
+            if (not quiet) and info is not None:
+                date_t, pos0, n_pred = info
+                prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
+                print(f"[{model}] refit at {pd.Timestamp(date_t).date()} using data up to {prev} | predicted {n_pred} days")
 
         return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
-    if model == "tabpfn25":  #changed
-        from tabpfn import TabPFNClassifier  #changed
 
-        i = 0  #changed
-        while i < len(loop_dates):  #changed
-            date_t = loop_dates[i]  #changed
-            pos = df.index.get_loc(date_t)  #changed
+    # -----------------------
+    # TabPFN (GPU/Metal/CPU): blocked sequential
+    # -----------------------
+    if model == "tabpfn25":
+        from tabpfn import TabPFNClassifier
 
-            train_mask = (df.index < date_t)  #changed
-            X_train_df = X_lag.loc[train_mask, feature_cols]  #changed
-            y_train_s = df.loc[train_mask, target_col]  #changed
+        i = 0
+        while i < len(loop_dates):
+            pos0 = loop_pos[i]
+            date_t = loop_dates[i]
 
-            m = X_train_df.notna().all(axis=1) & y_train_s.notna()  #changed
-            X_train = X_train_df.loc[m].to_numpy(np.float32)  #changed
-            y_train = y_train_s.loc[m].to_numpy(int)  #changed
+            X_train = X_lag_np[:pos0]
+            y_train = y_np[:pos0]
+            m = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+            X_train = X_train[m].astype(np.float32)
+            y_train = y_train[m].astype(int)
 
-            if max_train is not None and len(y_train) > max_train:  #changed
-                X_train = X_train[-max_train:]  #changed
-                y_train = y_train[-max_train:]  #changed
+            if max_train is not None and len(y_train) > max_train:
+                X_train = X_train[-max_train:]
+                y_train = y_train[-max_train:]
 
-            if len(y_train) < min_train:  #changed
-                i += 1  #changed
-                continue  #changed
+            if len(y_train) < min_train:
+                i += 1
+                continue
 
-            set_global_seed(seed + i)  #changed
-            model_tabpfn = TabPFNClassifier(device=device)  #changed
-            model_tabpfn.fit(X_train, y_train)  #changed
+            set_global_seed(seed + i)
+            clf = TabPFNClassifier(device=device)
+            clf.fit(X_train, y_train)
 
-            j = min(i + refit_every, len(loop_dates))  #changed
-            block_dates = loop_dates[i:j]  #changed
+            j = min(i + refit_every, len(loop_dates))
+            block_pos = loop_pos[i:j]
+            X_blk = X_lag_np[block_pos].astype(np.float32)
+            y_blk = y_np[block_pos]
 
-            X_block_df = X_lag.loc[block_dates, feature_cols]  #changed
-            y_block_s = df.loc[block_dates, target_col]  #changed
+            ok = np.isfinite(X_blk).all(axis=1) & np.isfinite(y_blk)
+            if ok.any():
+                preds = clf.predict(X_blk[ok]).astype(int)
+                dates_ok = df.index[block_pos][ok]
+                y_true_ok = y_blk[ok].astype(int)
 
-            ok = X_block_df.notna().all(axis=1) & y_block_s.notna()  #changed
-            if ok.any():  #changed
-                X_block = X_block_df.loc[ok].to_numpy(np.float32)  #changed
-                preds = model_tabpfn.predict(X_block).astype(int)  #changed  # (no chunking)
-                y_true_ok = y_block_s.loc[ok].to_numpy(int)  #changed
-                dates_ok = X_block_df.index[ok]  #changed
+                y_true_list.extend(y_true_ok.tolist())
+                y_pred_list.extend(preds.tolist())
+                date_list.extend(dates_ok.tolist())
 
-                y_true_list.extend(y_true_ok.tolist())  #changed
-                y_pred_list.extend(preds.tolist())  #changed
-                date_list.extend(dates_ok.tolist())  #changed
+            if not quiet:
+                prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
+                print(f"[tabpfn25] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")
 
-            if not quiet:  #changed
-                prev = df.index[pos - 1].date() if pos > 0 else "N/A"  #changed
-                print(f"[tabpfn25] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")  #changed
+            i = j
 
-            i = j  #changed
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
 
-        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)  #changed
+    # -----------------------
+    # Mantis (frozen backbone + head): blocked, with optional embedding cache
+    # -----------------------
+    if model in ("mantis_head", "mantis_rf_head"):
+        from mantis.architecture import Mantis8M
+        from mantis.trainer import MantisTrainer
 
-    for step, date_t in enumerate(loop_dates):
-        pos = df.index.get_loc(date_t)
+        mantis_network = Mantis8M(device=device).from_pretrained("paris-noah/Mantis-8M")
+        mantis_trainer = MantisTrainer(device=device, network=mantis_network)
 
-        y_true = df.loc[date_t, target_col]
-        if pd.isna(y_true):
-            continue
+        # Precompute embeddings once (big speed win)
+        if mantis_cache_embeddings:
+            Z_all, ok_embed = precompute_mantis_embeddings(
+                mantis_trainer,
+                feats_raw=feats_raw,
+                context_len=mantis_context_len,
+                chunk_size=mantis_embed_chunk,
+            )
+        else:
+            Z_all, ok_embed = None, None  # fallback to per-block transform
 
-        train_mask = (df.index < date_t)
+        head_is_lr = (model == "mantis_head")
 
-        need_refit = (fitted_model is None) or (last_fit_step is None) or ((step - last_fit_step) >= refit_every)
+        i = 0
+        while i < len(loop_dates):
+            pos0 = loop_pos[i]
+            date_t = loop_dates[i]
 
-        if need_refit:
-            set_global_seed(seed + step)
+            # train positions must be strictly < pos0, and >= context_len
+            train_pos = np.arange(mantis_context_len, pos0, dtype=int)
+            if len(train_pos) == 0:
+                i += 1
+                continue
 
-            # ---------------- TABULAR MODELS ----------------
-            if model in ("logit", "rf", "tabpfn25"):
-                X_train_df = X_lag.loc[train_mask, feature_cols]
-                y_train_s = df.loc[train_mask, target_col]
+            if mantis_cache_embeddings:
+                m_tr = ok_embed[train_pos] & np.isfinite(y_np[train_pos])
+                Z_tr = Z_all[train_pos][m_tr]
+                y_tr = y_np[train_pos][m_tr].astype(int)
 
-                m = X_train_df.notna().all(axis=1) & y_train_s.notna()
-                X_train = X_train_df.loc[m].to_numpy(float)
-                y_train = y_train_s.loc[m].to_numpy(int)
+                if mantis_max_train_windows is not None and len(y_tr) > mantis_max_train_windows:
+                    Z_tr = Z_tr[-mantis_max_train_windows:]
+                    y_tr = y_tr[-mantis_max_train_windows:]
 
-                if len(y_train) < min_train:
-                    fitted_model = None
+                if len(y_tr) < min_train:
+                    i += 1
                     continue
 
-                if model == "logit":
-                    fitted_model = Pipeline([
+                set_global_seed(seed + i)
+
+                if head_is_lr:
+                    head_model = Pipeline([
                         ("scaler", StandardScaler()),
                         ("clf", LogisticRegression(
                             max_iter=2000,
                             class_weight="balanced",
                             solver="lbfgs",
-                            random_state=seed + step,
+                            random_state=seed + i,
                         )),
                     ])
-                    fitted_model.fit(X_train, y_train)
-
-                elif model == "rf":
-                    rf = tune_rf_time_split(X_train, y_train, seed=seed + step)
-                    rf.fit(X_train, y_train)
-                    fitted_model = rf
-
-                elif model == "tabpfn25":
-                    from tabpfn import TabPFNClassifier
-                    fitted_model = TabPFNClassifier(device=device)  # TabPFN 2.5 default
-                    fitted_model.fit(X_train, y_train)
-
-                # clear mantis/majority state
-                head_model = None
-                majority_label = None
-
-            # ---------------- MANTIS (FROZEN BACKBONE + HEAD ONLY) ----------------
-            elif model in ("mantis_head", "mantis_rf_head"):
-                from mantis.architecture import Mantis8M
-                from mantis.trainer import MantisTrainer
-
-                if mantis_network is None:
-                    mantis_network = Mantis8M(device=device)
-                    mantis_network = mantis_network.from_pretrained("paris-noah/Mantis-8M")
-
-                mantis_trainer = MantisTrainer(device=device, network=mantis_network)
-
-                X_tr, y_tr = build_mantis_Xy(
-                    feats_raw, y_all, end_pos=pos, context_len=mantis_context_len
-                )
-                if X_tr is None or len(y_tr) < min_train:
-                    fitted_model = None
-                    head_model = None
-                    continue
-
-                # IMPORTANT: never call mantis_trainer.fit -> keeps backbone frozen
-                if model == "mantis_head":
-                    head_model = fit_mantis_head_frozen(
-                        mantis_trainer, X_tr, y_tr, head="lr", seed=seed + step
-                    )
+                    head_model.fit(Z_tr, y_tr)
                 else:
-                    head_model = fit_mantis_head_frozen(
-                        mantis_trainer, X_tr, y_tr, head="rf", seed=seed + step
-                    )
+                    # RF on embeddings
+                    rf_n_jobs = -1  # keep internal RF parallelism here; no outer parallel on GPU path
+                    head_model = make_default_rf(seed=seed + i, n_jobs=rf_n_jobs)
+                    head_model.fit(Z_tr, y_tr)
 
-                fitted_model = mantis_trainer  # feature extractor only
+                # predict block from cached Z
+                j = min(i + refit_every, len(loop_dates))
+                block_pos = loop_pos[i:j]
+                m_blk = ok_embed[block_pos] & np.isfinite(y_np[block_pos])
 
-                # clear majority state
-                majority_label = None
+                if m_blk.any():
+                    Z_blk = Z_all[block_pos][m_blk]
+                    preds = head_model.predict(Z_blk).astype(int)
 
-            # ---------------- MAJORITY BASELINE ----------------
-            elif model == "majority":
-                y_train = df.loc[train_mask, target_col].dropna().to_numpy()
-                if len(y_train) < min_train:
-                    fitted_model = None
-                    majority_label = None
-                    continue
+                    dates_ok = df.index[block_pos][m_blk]
+                    y_true_ok = y_np[block_pos][m_blk].astype(int)
 
-                vals, counts = np.unique(y_train.astype(int), return_counts=True)
-                majority_label = int(vals[np.argmax(counts)])
-                fitted_model = "majority"  # marker
+                    y_true_list.extend(y_true_ok.tolist())
+                    y_pred_list.extend(preds.tolist())
+                    date_list.extend(dates_ok.tolist())
 
-                # clear mantis head state
-                head_model = None
+                if not quiet:
+                    prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
+                    print(f"[{model}] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")
+
+                i = j
 
             else:
-                raise ValueError("Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head, majority")
+                # fallback: per-block transform (slower; keeps your old behavior mostly)
+                # Build training windows -> transform -> fit head
+                X_tr, ok_tr_pos = build_mantis_X_block(
+                    feats_raw, positions=train_pos, context_len=mantis_context_len
+                )
+                if X_tr is None:
+                    i += 1
+                    continue
 
-            last_fit_step = step
-            if not quiet:
-                prev = df.index[pos-1].date() if pos > 0 else "N/A"
-                print(f"[{model}] refit at {date_t.date()} using data up to {prev}")
+                y_tr = y_np[ok_tr_pos]
+                m = np.isfinite(y_tr)
+                X_tr = X_tr[m]
+                y_tr = y_tr[m].astype(int)
 
-        if fitted_model is None:
-            continue
+                if mantis_max_train_windows is not None and len(y_tr) > mantis_max_train_windows:
+                    X_tr = X_tr[-mantis_max_train_windows:]
+                    y_tr = y_tr[-mantis_max_train_windows:]
 
-        # ---------------- PREDICT ----------------
-        if model in ("logit", "rf", "tabpfn25"):
-            x_row = X_lag.loc[date_t, feature_cols]
-            if x_row.isna().any():
-                continue
-            X_te = x_row.to_numpy(float).reshape(1, -1)
-            y_hat = int(fitted_model.predict(X_te)[0])
+                if len(y_tr) < min_train:
+                    i += 1
+                    continue
 
-        elif model in ("mantis_head", "mantis_rf_head"):
-            X_one = build_mantis_X_one(feats_raw, pos=pos, context_len=mantis_context_len)
-            if X_one is None:
-                continue
-            if head_model is None:
-                continue
-            Z_one = np.asarray(fitted_model.transform(X_one), float)
-            y_hat = int(head_model.predict(Z_one)[0])
+                set_global_seed(seed + i)
+                head_model = fit_mantis_head_frozen(
+                    mantis_trainer, X_tr, y_tr,
+                    head="lr" if head_is_lr else "rf",
+                    seed=seed + i
+                )
 
-        elif model == "majority":
-            if majority_label is None:
-                continue
-            y_hat = int(majority_label)
+                # predict next block windows
+                j = min(i + refit_every, len(loop_dates))
+                block_pos = loop_pos[i:j]
+                X_blk, ok_blk_pos = build_mantis_X_block(
+                    feats_raw, positions=block_pos, context_len=mantis_context_len
+                )
+                if X_blk is not None and len(ok_blk_pos) > 0:
+                    Z_blk = np.asarray(mantis_trainer.transform(X_blk), dtype=np.float32)
+                    preds = head_model.predict(Z_blk).astype(int)
 
-        else:
-            raise RuntimeError("Internal: unknown model at prediction stage.")
+                    dates_ok = df.index[ok_blk_pos]
+                    y_true_ok = y_np[ok_blk_pos].astype(int)
 
-        y_true_list.append(int(y_true))
-        y_pred_list.append(int(y_hat))
-        date_list.append(date_t)
+                    m_ok = np.isfinite(y_true_ok)
+                    y_true_ok = y_true_ok[m_ok]
+                    preds = preds[m_ok]
+                    dates_ok = dates_ok[m_ok]
 
-    return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
+                    y_true_list.extend(y_true_ok.tolist())
+                    y_pred_list.extend(preds.tolist())
+                    date_list.extend(dates_ok.tolist())
+
+                if not quiet:
+                    prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
+                    print(f"[{model}] refit at {date_t.date()} using data up to {prev} | predicted {j-i} days")
+
+                i = j
+
+        return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
+
+    raise ValueError(
+        "Unknown model. Use: logit, rf, tabpfn25, mantis_head, mantis_rf_head, majority"
+    )
