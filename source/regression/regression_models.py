@@ -281,7 +281,7 @@ def autoarima_oos(
     start_oos: str = "1965-01-01",
     freq: str = "MS",                # user-facing freq, but we will align to MS internally
     prediction_length: int = 1,      # this implementation only supports 1-step
-    min_history_months: int = 60,
+    min_history_months: int = 24,
     seasonal: bool | None = None,
     m: int | None = None,
     ct_cutoff: bool = True,
@@ -365,21 +365,26 @@ def autoarima_oos(
         if need_search:
             if not quiet:
                 print(f"[AutoARIMA] Searching best order at {date_t.date()}...")
-            model = auto_arima(
-                y_hist.values,
-                seasonal=seasonal,
-                m=m,
-                error_action="ignore",
-                suppress_warnings=True,
-                stepwise=True,
-                **auto_arima_kwargs,
-            )
+            
+            # --- SUPPRESS SKLEARN FUTUREWARNINGS HERE ---
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=FutureWarning)
+                model = auto_arima(
+                    y_hist.values,
+                    seasonal=seasonal,
+                    m=m,
+                    error_action="ignore",
+                    suppress_warnings=True,
+                    stepwise=True,
+                    **auto_arima_kwargs,
+                )
+            # --------------------------------------------
+            
             state["order"] = model.order
             state["seasonal_order"] = model.seasonal_order
             if not quiet:
                 print(f"  best order={model.order}, seasonal_order={model.seasonal_order}")
         else:
-            # IMPORTANT: do NOT pass seasonal/m here to avoid the FutureWarning
             model = ARIMA(
                 order=state["order"],
                 seasonal_order=state["seasonal_order"],
@@ -389,9 +394,10 @@ def autoarima_oos(
         if refit_each_step:
             try:
                 with warnings.catch_warnings():
-                    if quiet:
-                        warnings.simplefilter("ignore")
-                        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                    # We ignore both Convergence and FutureWarnings during fit
+                    warnings.simplefilter("ignore")
+                    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                    warnings.filterwarnings("ignore", category=FutureWarning)
                     model = model.fit(y_hist.values)
             except Exception as e:
                 if not quiet:
@@ -401,16 +407,14 @@ def autoarima_oos(
         # 1-step forecast
         try:
             with warnings.catch_warnings():
-                if quiet:
-                    warnings.simplefilter("ignore")
-                fc = model.predict(n_periods=1)
+                warnings.simplefilter("ignore")
+                fc, conf_int = model.predict(n_periods=1, return_conf_int=True)
         except Exception as e:
             if not quiet:
                 print(f"[AutoARIMA] predict failed at {date_t}: {e}")
             return None
 
-        return float(fc[0])
-
+        return [float(fc[0]), float(conf_int[0,0]), float(conf_int[0,1])]
     # ------------------------------------------------------------------
     # 4. Wrap this into model_fit_predict_fn for expanding_oos_tabular
     # ------------------------------------------------------------------
@@ -434,7 +438,6 @@ def autoarima_oos(
         df,                          # month-start target series
         target_col=target_col,
         start_oos=start_oos,
-        start_date=start_oos,
         min_train=min_history_months,
         min_history_months=min_history_months,
         ct_cutoff=ct_cutoff,
