@@ -222,7 +222,7 @@ def expanding_oos_refit_every_cls(
     # numpy versions for speed
     X_lag_np = X_lag[feature_cols].to_numpy(dtype=np.float32)          # (T, F) with NaN
     y_np = df[target_col].to_numpy(dtype=float)                        # (T,) with NaN possible
-    feats_raw = df[feature_cols].to_numpy(dtype=float)                 # (T, F) raw feats for Mantis windows
+    feats_raw = df[feature_cols].to_numpy(dtype=float) #Lookup since not sure                 # (T, F) raw feats for Mantis windows
 
     # map timestamps -> integer positions once (avoid get_loc in loops)
     idx_map = pd.Series(np.arange(len(df.index)), index=df.index)
@@ -238,7 +238,7 @@ def expanding_oos_refit_every_cls(
         i = block_start_i
         pos0 = loop_pos[i]
         date_t = loop_dates[i]
-
+        print(f"CPU worker processing block starting at index {i}, date {date_t.date()}")
         # training strictly before pos0
         X_train = X_lag_np[:pos0]
         y_train = y_np[:pos0]
@@ -328,7 +328,7 @@ def expanding_oos_refit_every_cls(
             if (not quiet) and info is not None:
                 date_t, pos0, n_pred = info
                 prev = df.index[pos0 - 1].date() if pos0 > 0 else "N/A"
-                print(f"[{model}] refit at {pd.Timestamp(date_t).date()} using data up to {prev} | predicted {n_pred} days")
+                
 
         return np.asarray(y_true_list, int), np.asarray(y_pred_list, int), pd.DatetimeIndex(date_list)
 
