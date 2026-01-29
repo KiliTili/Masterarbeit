@@ -372,9 +372,8 @@ def expanding_oos_refit_every_cls(
 
             ok = np.isfinite(X_blk).all(axis=1) & np.isfinite(y_blk)
             if ok.any():
-                e = clf.predict(X_blk[ok])
-                preds = e.astype(int)
-                probas = e[:, 1]
+                preds = clf.predict(X_blk[ok]).astype(int)
+                probas = clf.predict(X_blk[ok])
                 dates_ok = df.index[block_pos][ok]
                 y_true_ok = y_blk[ok].astype(int)
 
