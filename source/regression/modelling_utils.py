@@ -386,7 +386,8 @@ def expanding_oos_tabular(
     quiet: bool = False,
     model_name: str = "Model",
     model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
-    mode = "mean"
+    mode = "mean",
+    return_addtional_info: bool = False,
 ) -> Tuple[float, np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """
     Generic expanding-window OOS driver for tabular models (1-step ahead).
@@ -473,7 +474,15 @@ def expanding_oos_tabular(
     r2_wct, stats_wct = evaluate_oos(trues, preds_before_ct, y_bench=HA, model_name=model_name+" (WCT)", quiet=quiet)
     print(f"evaluate_oos calculated R2 WCT: {r2_wct}")
     print(f"Stats WCT: {stats_wct}")
-    
+    additional_info = {
+        "r2_wct": r2_wct,
+        "stats_wct": stats_wct,
+        "truncated_count": truncated,
+        "total_predictions": len(preds),
+    }
+
     r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
-    return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA
+    if return_addtional_info:
+        return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA, additional_info
+    return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA, 
 

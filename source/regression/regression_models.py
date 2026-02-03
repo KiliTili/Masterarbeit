@@ -55,6 +55,7 @@ def ols_oos(
     quiet: bool = False,
     model_name: str | None = None,
     ci = 0.9,
+    return_addtional_info: bool = False,
 ):
     """
     Expanding-window OLS with lagged predictors (1-step ahead).
@@ -107,6 +108,7 @@ def ols_oos(
         quiet=quiet,
         model_name=model_name,
         model_fit_predict_fn=fit_predict,
+        return_addtional_info = return_addtional_info,
     )
 
 
@@ -129,24 +131,22 @@ def rank_monthly_predictors(
         start_date_var = max(pd.Timestamp(start_date), start_date_var)
         start_oos_var = max(pd.Timestamp(start_oos), start_date_var + pd.DateOffset(years=10)) 
         enddate = data.index[data[v].notna()].max()
-        try:
-            r2,_, _, _, _,_,_,_ = ols_oos(
-                data[(data.index >= start_date_var) &(data.index <= enddate)],
-                variables=(v,),
-                target_col="equity_premium",
-                start_oos=start_oos_var,
-                start_date=start_date_var,
-                lag=lag,
-                min_train=30,
-                ct_cutoff=ct_cutoff,
-                quiet=True,
-                model_name=f"OLS({v})",
-            )
-        except Exception as e:
-            r2 = float("nan")
-            if not quiet:
-                print(f"[WARN] {v}: {e}")
-        results.append({"variable": v, "r2_oos": r2, "start_oos": start_oos_var, "start_date": start_date_var, "end_date": enddate})
+        
+        r2,stats, _, _, _,_,_,_,additional = ols_oos(
+            data[(data.index >= start_date_var) &(data.index <= enddate)],
+            variables=(v,),
+            target_col="equity_premium",
+            start_oos=start_oos_var,
+            start_date=start_date_var,
+            lag=lag,
+            min_train=30,
+            ct_cutoff=ct_cutoff,
+            quiet=True,
+            model_name=f"OLS({v})",
+            return_addtional_info=True
+        )
+    
+        results.append({"variable": v, "r2_oos": r2, "stats": stats, "start_oos": start_oos_var, "start_date": start_date_var, "end_date": enddate, "additional_info": additional})
 
     res_df = pd.DataFrame(results)
     sort_key = res_df["r2_oos"].fillna(-inf)
@@ -156,7 +156,7 @@ def rank_monthly_predictors(
     for i, row in res_df.iterrows():
         r2 = row["r2_oos"]
         r2_str = "NaN" if pd.isna(r2) else f"{r2:.4f}"
-        print(f"{i+1:2d}. {row['variable']:>10s}   R²_OOS = {r2_str} | data: {row['start_date'].date()} to {row['end_date'].date()} | OOS start: {row['start_oos'].date()}")
+        print(f"{i+1:2d}. {row['variable']:>10s}   R²_OOS = {r2_str} | Std: {row['stats']['std']:.4f} |data: {row['start_date'].date()} to {row['end_date'].date()} | OOS start: {row['start_oos'].date()} | R^2OOSCT: {row['additional_info']['r2_wct']:.4f} | R^2OOSCT Std: {row['additional_info']['stats_wct']['std']:.4f} ")
 
     return res_df
 
