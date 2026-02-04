@@ -137,7 +137,7 @@ def expanding_oos_refit_every_cls_bootstrap_binary(
     *,
     feature_cols: list[str],
     target_col: str = "state",
-    start_oos: str = "2007-01-01",
+    start_oos: str = "2010-01-01",
     start_date: str = "2000-01-05",
     min_train: int = 120,
     refit_every: int = 30,

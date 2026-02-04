@@ -32,17 +32,20 @@ def calculate_block_bootstrap_stats(
     y_pred: np.ndarray,
     baseline_pred: np.ndarray,
     block_size: int = 12,      # 12 months block size to preserve seasonality
-    n_bootstraps: int = 1000
+    n_bootstraps: int = 1000,
+    random_state: int = 42     # Added for reproducibility
 ) -> dict:
     """
     Performs block bootstrapping on the *errors* of the model vs baseline
     to estimate the distribution of the R2 metric.
     """
+    # Initialize the random number generator
+    rng = np.random.default_rng(random_state)
+    
     n_samples = len(y_true)
     r2_bootstraps = []
     
     # 1. Calculate Error Vectors (Residuals squared)
-    # We bootstrap these errors to preserve the correlation structure
     err_model = (y_true - y_pred) ** 2
     err_baseline = (y_true - baseline_pred) ** 2
 
@@ -50,15 +53,15 @@ def calculate_block_bootstrap_stats(
         # 2. Generate Block Indices
         indices = []
         while len(indices) < n_samples:
-            start_idx = np.random.randint(0, n_samples - block_size + 1)
-            # Select a contiguous block
+            # We select a random start point for a block
+            # Using rng.integers is the modern replacement for np.random.randint
+            start_idx = rng.integers(0, n_samples - block_size + 1)
             indices.extend(range(start_idx, start_idx + block_size))
         
-        # Trim to original length
+        # Trim to original length to ensure consistent sample size
         indices = np.array(indices[:n_samples])
 
         # 3. Calculate R2 for this specific bootstrap sample
-        # Sum of squared errors for the sample
         sse_model = np.sum(err_model[indices])
         sse_baseline = np.sum(err_baseline[indices])
         
@@ -74,7 +77,7 @@ def calculate_block_bootstrap_stats(
     r2_bootstraps = np.array([x for x in r2_bootstraps if not np.isnan(x)])
     
     if len(r2_bootstraps) == 0:
-        return {"std": np.nan, "lower": np.nan, "upper": np.nan}
+        return {"mean": np.nan, "std": np.nan, "lower": np.nan, "upper": np.nan}
 
     return {
         "mean": np.mean(r2_bootstraps),
@@ -82,7 +85,6 @@ def calculate_block_bootstrap_stats(
         "lower": np.percentile(r2_bootstraps, 2.5),   # 95% Confidence Interval
         "upper": np.percentile(r2_bootstraps, 97.5)
     }
-
 
 
 def plot_oos_multi(models, ylabel="Equity premium"):
@@ -388,6 +390,7 @@ def expanding_oos_tabular(
     model_fit_predict_fn: Callable[[pd.DataFrame, pd.Series], float] | None = None,
     mode = "mean",
     return_addtional_info: bool = False,
+    add_to_csv: bool = True,
 ) -> Tuple[float, np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """
     Generic expanding-window OOS driver for tabular models (1-step ahead).
@@ -442,7 +445,7 @@ def expanding_oos_tabular(
             continue
         preds_before_ct.append(float(y_hat))
         if ct_cutoff:
-            if y_hat < 0:
+            if y_hat <= 0:
                 truncated += 1
             y_hat = float(ct_truncate(y_hat))
 
@@ -462,7 +465,7 @@ def expanding_oos_tabular(
     print(f"percentage of negative forecasts before truncation: {truncated/len(preds)*100:.2f}%")
         
 
-     # Manually calculate R2 for verification
+    # Manually calculate R2 for verification
     trues = np.asarray(trues, float)
     preds = np.asarray(preds, float)        
     HA = np.asarray(HA, float)
@@ -480,9 +483,91 @@ def expanding_oos_tabular(
         "truncated_count": truncated,
         "total_predictions": len(preds),
     }
-
+    #calculate hit rate meaning preds>0 & trues >0
+    a = ct_eval_summary(trues, preds, oos_r2=r2, cutoff=0.0)
+    print(f"CT Eval Summary: {a}")
     r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
+    if add_to_csv:
+        
+        df = pd.DataFrame({
+            "model_name": [model_name],
+            "r2ct": [r2],
+            "r2": [r2_wct],
+            "truncated_percent": [truncated/len(preds)],
+            "r2ctmean": [stats['mean']],
+            "r2ctstd": [stats['std']],
+            "r2ctlower": [stats['lower']],
+            "r2ctupper": [stats['upper']],
+            "r2mean": [stats_wct['mean']],
+            "r2std": [stats_wct['std']],
+            "r2lower": [stats_wct['lower']],
+            "r2upper": [stats_wct['upper']],   
+            "hit_spread": [a['timing_spread']],
+            "hit_share": [a['share_in_market']],
+        })
+        csv_file = "oos_results_regressionNow.csv"
+        try:
+            existing_df = pd.read_csv(csv_file)
+            df = pd.concat([existing_df, df], ignore_index=True)
+        except FileNotFoundError:
+            pass
+        df.to_csv(csv_file, index=False)
+
     if return_addtional_info:
         return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA, additional_info
+
     return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA, 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+
+def ct_eval_summary(y_true, y_pred, *, oos_r2=None, cutoff=0.0):
+    """
+    Minimal, thesis-friendly summary for a CT (0-cutoff) long/flat timing rule.
+
+    Metrics (2-3 max):
+      - timing_spread: mean(y | pred>cutoff) - mean(y | pred<=cutoff)
+      - share_in_market: fraction of periods with pred>cutoff
+      - oos_r2: optional forecasting metric (kept separate from timing metrics)
+
+    y_true: realized equity premia (y_t)
+    y_pred: forecasts (ŷ_t), same length as y_true
+    oos_r2: optional float; pass your already-computed OOS R² here
+    cutoff: CT cutoff (default 0.0)
+    """
+    y = np.asarray(y_true, float).ravel()
+    p = np.asarray(y_pred, float).ravel()
+
+    in_mkt = p > cutoff
+    share_in = float(np.mean(in_mkt))
+
+    y_in = y[in_mkt]
+    y_out = y[~in_mkt]
+
+    mean_in = float(np.mean(y_in)) if y_in.size else np.nan
+    mean_out = float(np.mean(y_out)) if y_out.size else np.nan
+    timing_spread = mean_in - mean_out
+
+    out = {
+        "timing_spread": float(timing_spread) if np.isfinite(timing_spread) else np.nan,
+        "share_in_market": share_in,
+    }
+
+    return out

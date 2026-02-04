@@ -462,6 +462,7 @@ def chronos_oos(
     quiet=False,
     mode = "mean",
     model_id = "amazon/chronos-bolt-small",
+    model_name="Chronos-Bolt (1-step)",
     ci = 0.9,
 ):
     """
@@ -515,7 +516,7 @@ def chronos_oos(
         min_history_months=ctx_min,
         ct_cutoff=ct_cutoff,
         quiet=quiet,
-        model_name="Chronos-Bolt (1-step)",
+        model_name=model_name,
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
     )
@@ -1076,6 +1077,8 @@ def chronos2_oos(
     ci = 0.9,
     bootstrap = None, #(1,12,True,True)
     context_length = None,
+    model_name="Chronos-2 (w/ Covariates)",
+    save_results = True,
 ):
     """
     1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
@@ -1200,9 +1203,10 @@ def chronos2_oos(
         min_history_months=ctx_min,
         ct_cutoff=ct_cutoff,
         quiet=quiet,
-        model_name="Chronos-2 (w/ Covariates)",
+        model_name=model_name,
         model_fit_predict_fn=model_fit_predict_fn,
         mode=mode,
+        add_to_csv=save_results
     )
 
 

@@ -121,10 +121,15 @@ def label_states(df_diff, variable='M1WO', n_states=2, quiet=True, plot = True, 
 
 def create_classification_data(file_path="../../Data/GoyalAndWelch.xlsx", quiet=True, random_state=42):
     df = pd.read_csv("../../Data/MSCI_World_Data.csv")
-    
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
     df_diff = difference_over_variables(df.copy())
     df_diff['timestamp'] = pd.to_datetime(df_diff['timestamp'])
-    df_diff["M1WO_O"] = df["M1WO"].copy()
+    df_diff = df_diff.merge(
+        df[["timestamp", "M1WO"]].rename(columns={"M1WO": "M1WO_O"}),
+        on="timestamp",
+        how="left"
+    )
     df_states = label_states(df_diff, quiet=quiet, random_state=random_state)
     return df_states
 

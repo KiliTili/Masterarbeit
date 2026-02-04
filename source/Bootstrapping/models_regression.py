@@ -222,8 +222,8 @@ def bootstrap_refit_train_test(
     *,
     target_col: str,
     feature_cols: list[str],
+    start_oos: str = "1965-01-01",
     start_data: str = "1927-01-01",
-    start_oos: str,
     min_train: int = 240,
     B: int = 1000,
     seed: int = 42,
@@ -239,7 +239,7 @@ def bootstrap_refit_train_test(
 ):
     df = ensure_datetime_index(df).copy()
 
-    df = df[df.index >= start_oos]
+    df = df[df.index >= start_data]
     df_additional = df[(df.index < start_oos) & (df.index >= start_data)]
     # Bootstrap distribution
     boot_r2 = np.empty(B, float)
