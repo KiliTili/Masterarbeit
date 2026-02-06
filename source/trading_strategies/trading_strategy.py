@@ -95,7 +95,7 @@ def perf_stats(total_returns, excess_returns=None, periods_per_year=12):
         "TotalReturn": float(total_ret),
         "CAGR": float(cagr),
         "AnnVol": float(ann_vol),
-        "Sharpe(excess)": float(sharpe) if np.isfinite(sharpe) else np.nan,
+        "Sharpe": float(sharpe) if np.isfinite(sharpe) else np.nan,
         "MaxDrawdown": float(max_dd),
     }
 
@@ -175,7 +175,7 @@ def compare_strategies(df_bt, r_excess_col="r_excess", gamma=5.0, vol_window=60,
     rows = []
     for col in R.columns:
         stats = perf_stats(R[col], RE[col], periods_per_year=periods_per_year)
-        stats["AnnUtility"] = ann_utility(R[col], gamma=gamma, periods_per_year=periods_per_year)
+        stats["CEV"] = ann_utility(R[col], gamma=gamma, periods_per_year=periods_per_year)
         stats["Strategy"] = col
         rows.append(stats)
 
@@ -185,9 +185,9 @@ def compare_strategies(df_bt, r_excess_col="r_excess", gamma=5.0, vol_window=60,
     summary["Δu vs HA"] = np.nan
     summary["Δu vs 50%"] = np.nan
     summary["Δu vs 100%"] = np.nan
-    summary.loc["Model", "Δu vs HA"] = summary.loc["Model", "AnnUtility"] - summary.loc["HA", "AnnUtility"]
-    summary.loc["Model", "Δu vs 50%"] = summary.loc["Model", "AnnUtility"] - summary.loc["W50", "AnnUtility"]
-    summary.loc["Model", "Δu vs 100%"] = summary.loc["Model", "AnnUtility"] - summary.loc["W100", "AnnUtility"]
+    summary.loc["Model", "Δu vs HA"] = summary.loc["Model", "CEV"] - summary.loc["HA", "CEV"]
+    summary.loc["Model", "Δu vs 50%"] = summary.loc["Model", "CEV"] - summary.loc["W50", "CEV"]
+    summary.loc["Model", "Δu vs 100%"] = summary.loc["Model", "CEV"] - summary.loc["W100", "CEV"]
 
     return summary
 
