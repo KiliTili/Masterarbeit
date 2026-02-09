@@ -507,11 +507,11 @@ def expanding_oos_tabular(
         })
         csv_file = "oos_results_regressionNow.csv"
         try:
-            existing_df = pd.read_csv(csv_file)
+            existing_df = pd.read_csv(csv_file, sep=";")
             df = pd.concat([existing_df, df], ignore_index=True)
         except FileNotFoundError:
             pass
-        df.to_csv(csv_file, index=False)
+        df.to_csv(csv_file, sep=";", index=False)
 
     if return_addtional_info:
         return r2, stats, trues, preds, pd.DatetimeIndex(oos_dates), y_lowers, y_uppers, HA, additional_info

@@ -1085,6 +1085,7 @@ def chronos2_oos(
     """
     1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
     """
+    from chronos import BaseChronosPipeline
     if prediction_length != 1:
         raise ValueError("This chronos2_oos version supports only prediction_length=1.")
 
