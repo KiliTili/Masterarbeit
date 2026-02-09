@@ -263,6 +263,16 @@ def compare_regime_strategies(
     if bm in summary.index:
         summary[f"Δu vs {bm}"] = summary["AnnUtility"] - summary.loc[bm, "AnnUtility"]
 
+    summary["Δu vs HA"] = np.nan  #Changed
+    summary["Δu vs 50%"] = np.nan  #Changed
+    summary["Δu vs 100%"] = np.nan  #Changed
+    if "HA" in summary.index:  #Changed
+        summary.loc["Strategy", "Δu vs HA"] = summary.loc["Strategy", "AnnUtility"] - summary.loc["HA", "AnnUtility"]  #Changed
+    if "Static50_50" in summary.index:  #Changed
+        summary.loc["Strategy", "Δu vs 50%"] = summary.loc["Strategy", "AnnUtility"] - summary.loc["Static50_50", "AnnUtility"]  #Changed
+    if "BuyHoldEq" in summary.index:  #Changed
+        summary.loc["Strategy", "Δu vs 100%"] = summary.loc["Strategy", "AnnUtility"] - summary.loc["BuyHoldEq", "AnnUtility"]  #Changed
+
     return summary
 
 
