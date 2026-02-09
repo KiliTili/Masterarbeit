@@ -449,7 +449,7 @@ def autoarima_oos(
 # ================================================================
 # 5. DEEP TS MODELS – CHRONOS
 # ================================================================
-from chronos import BaseChronosPipeline
+
 
 def chronos_oos(
     data: pd.DataFrame,
@@ -470,6 +470,7 @@ def chronos_oos(
 
     For true multi-step forecasts, keep a separate function using expanding_oos_univariate.
     """
+    from chronos import BaseChronosPipeline
     if prediction_length != 1:
         raise ValueError("This chronos_oos version supports only prediction_length=1.")
 
@@ -521,8 +522,7 @@ def chronos_oos(
         mode=mode,
     )
 # 5.2 Moirai2
-from gluonts.dataset.common import ListDataset
-from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
+
 def moirai2_oos(
     data: pd.DataFrame,
     covariates=("d/p", "tms", "dfy"),
@@ -541,6 +541,8 @@ def moirai2_oos(
     Same as your original moirai2_oos, but using expanding_oos_tabular
     instead of expanding_oos_univariate. Only supports 1-step ahead.
     """
+    from gluonts.dataset.common import ListDataset
+    from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
     if prediction_length != 1:
         raise ValueError("This moirai2_oos(tabular) version supports only prediction_length=1.")
 
