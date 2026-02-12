@@ -1081,6 +1081,8 @@ def chronos2_oos(
     context_length = None,
     model_name="Chronos-2 (w/ Covariates)",
     save_results = True,
+    start_pos = 0,
+    cov_style = "past" # style is "past" or "future"
 ):
     """
     1-step-ahead OOS evaluation using Chronos-2 with Covariate support.
@@ -1144,20 +1146,38 @@ def chronos2_oos(
         # We need at least ctx_min history
         if pos < ctx_min:
             return None
-        if context_length:
-            target_hist = y.values[pos-context_length:pos]    
-            past_covs = {
-                col: cov_df[col].values[pos-context_length:pos] 
-                for col in covariates
-            }
-        else:
-            # 1. Target History: 0 ... t-1
-            target_hist = y.values[:pos]
-            # 2. Past Covariates: 0 ... t-1
-            past_covs = {
-                col: cov_df[col].values[:pos] 
-                for col in covariates
-            }
+        if cov_style == "past":
+            if context_length and pos >= context_length:
+                target_hist = y.values[pos-context_length:pos]    
+                past_covs = {
+                    col: cov_df[col].values[pos-context_length:pos] 
+                    for col in covariates
+                }
+            else:
+                # 1. Target History: 0 ... t-1
+                target_hist = y.values[start_pos:pos]
+                # 2. Past Covariates: 0 ... t-1
+                past_covs = {
+                    col: cov_df[col].values[start_pos:pos] 
+                    for col in covariates
+                }
+                #futur_covs = {col: cov_df[col].values[pos-1:pos] for col in covariates}
+        else: # future style
+            if context_length and pos >= context_length:
+                target_hist = y.values[pos-context_length+1:pos]    
+                past_covs = {
+                    col: cov_df[col].values[pos-context_length:pos-1] 
+                    for col in covariates
+                }
+                futur_covs = {col: cov_df[col].values[pos-1:pos] for col in covariates}
+            else:
+                
+                target_hist = y.values[start_pos+1:pos]
+                past_covs = {
+                        col: cov_df[col].values[start_pos:pos-1] 
+                        for col in covariates
+                    }
+                futur_covs = {col: cov_df[col].values[pos-1:pos] for col in covariates}
         if bootstrap:
 
             rng = np.random.default_rng(pos + bootstrap[0])  # seed however you like
@@ -1172,11 +1192,17 @@ def chronos2_oos(
 
         
         # Construct input dictionary
-        entry = {
-            "target": target_hist,
-            "past_covariates": past_covs,
-            # "future_covariates": future_covs
-        }
+        if cov_style == "past":
+            entry = {
+                "target": target_hist,
+                "past_covariates": past_covs,
+            }
+        else:
+            entry = {
+                "target": target_hist,
+                "past_covariates": past_covs,
+                "future_covariates": futur_covs
+            }
 
         # Predict
         with torch.inference_mode():
@@ -1186,7 +1212,9 @@ def chronos2_oos(
                 prediction_length=1,
                 quantile_levels=[(1 - ci) / 2,0.5,1 - (1 - ci) / 2], 
             )
-
+            if float(mean_pred[0][0, 0].item()) != float(quantiles[0][0,0,1].item()):
+                
+                print(f"Warning: mean_pred {float(mean_pred[0][0, 0].item())} != median quantile {float(quantiles[0][0,0,1].item())}")
             
         # Extract the scalar prediction
         # mean_pred is a list -> mean_pred[0] is the tensor -> [0, 0] is the value

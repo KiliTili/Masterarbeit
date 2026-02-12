@@ -94,7 +94,7 @@ def build_mantis_X_block(
         return None, None
 
     X = np.stack(X_list, axis=0).astype(np.float32)  # (N, C, L)
-    X = mantis_resize_to_512(X)  # (N, C, 512)
+    #X = mantis_resize_to_512(X)  # (N, C, 512)
     return X, np.asarray(ok_pos, dtype=int)
 
 
