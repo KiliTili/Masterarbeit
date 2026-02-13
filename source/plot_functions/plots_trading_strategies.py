@@ -214,7 +214,7 @@ def plot_regression_timing_total_return_models(
 
     # ---------- Build selected baseline curves on the SAME bt_first sample ----------
     base_curves = {}
-
+    bt_first = bt_first.dropna()
     r_excess = bt_first["r_excess"].astype(float)
     rf = bt_first["rf"].astype(float)
 
