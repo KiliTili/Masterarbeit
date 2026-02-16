@@ -32,6 +32,7 @@ def backtest_timing_strategy(
     vol_window=60,
     w_min=0.0,
     w_max=1.5,
+    lag = 0,
 ):
     d = df.copy()
 
@@ -46,6 +47,7 @@ def backtest_timing_strategy(
     var = r_excess.rolling(vol_window, min_periods=vol_window).var().shift(1)
 
     # 4) Mean–variance weight + bounds
+    pred_excess = pred_excess.shift(lag)
     w = (pred_excess / (gamma * var)).clip(w_min, w_max)
 
     # 5) Portfolio returns
@@ -286,6 +288,7 @@ def backtest_paper_regime_switch(
     tc_bps: float = 0.0,
     ts_col: str = "timestamp",
     bear_label: str = "bear",
+    lag: int = 0
 ):
     d = df.copy()
 
@@ -305,10 +308,10 @@ def backtest_paper_regime_switch(
     if reg.dtype == "O":
         is_bear = reg.astype(str).str.lower().eq(str(bear_label).lower())
     else:
-        is_bear = reg.astype(float).fillna(0.0).astype(int).eq(1)
+        is_bear = reg.astype(float).fillna(0.0).astype(int).eq(bear_label)
 
     w = (~is_bear).astype(float)   # bull=1 (equity), bear=0 (cash)
-
+    w = w.shift(lag) 
     # --- transaction costs ---
     turnover = w.diff().abs().fillna(0.0)
     cost = (tc_bps / 10000.0) * turnover

@@ -11,6 +11,7 @@ import source.trading_strategies.trading_strategy as tsh
 # df = dp.create_classification_data(quiet=False)
 # df["Rfree"] = 0
 
+
 def plot_total_return_models_vs_w100(
     pred_dfs: dict,
     df_mkt: pd.DataFrame,
@@ -26,16 +27,9 @@ def plot_total_return_models_vs_w100(
     w100_lw: float = 2.4,
     model_lw: float = 1.8,
     start_date: str = "2010-01-01",
+    lag: int = 0,
+    debug: bool = False,
 ):
-    """
-    Plot cumulative total return (wealth-1) for multiple model strategies,
-    with ONLY ONE baseline: Buy&Hold Equity (W100).
-
-    pred_dfs: dict like {"Logit": pred_df_logit, "RF": pred_df_rf, ...}
-             each pred_df must contain columns: ["timestamp", regime_col]
-    df_mkt: DataFrame containing ["timestamp", price_col] and optionally rf_col
-    """
-
     if not isinstance(pred_dfs, dict) or len(pred_dfs) == 0:
         raise ValueError("pred_dfs must be a non-empty dict: {name: pred_df}.")
 
@@ -53,12 +47,13 @@ def plot_total_return_models_vs_w100(
         .sort_values("timestamp")
         .set_index("timestamp")
     )
-    
-    df_m = df_m[df_m.index >= pd.to_datetime(start_date)]
-    curves = {}
-    w100_curve = None
 
-    # Build curves per model
+    df_m = df_m[df_m.index >= pd.to_datetime(start_date)]
+
+    # --- collect RETURN series first ---
+    model_rets = {}
+    w100_ret = None
+
     for name, pred_df in pred_dfs.items():
         d = pred_df.copy()
         if "timestamp" not in d.columns:
@@ -81,40 +76,48 @@ def plot_total_return_models_vs_w100(
             rf_col=rf_col,
             tc_bps=tc_bps,
             bear_label=bear_label,
+            lag=lag,
         )
 
-        wealth_model = (1.0 + bt["strategy_net"]).cumprod()
-        curves[name] = (wealth_model - 1.0)
-        #print last return value for each model
-        print(f"{name} total return: {wealth_model.iloc[-1] - 1:.2%}") 
+        model_rets[name] = bt["strategy_net"].astype(float)
 
-        # Use the first model’s backtest sample for W100 (then we align everything anyway)
-        if w100_curve is None:
-            wealth_w100 = (1.0 + bt["buy_hold_eq"]).cumprod()
-            w100_curve = (wealth_w100 - 1.0)
+        if w100_ret is None:
+            w100_ret = bt["buy_hold_eq"].astype(float)
 
-    # Align all model curves + W100 to a common index intersection
-    common_idx = w100_curve.index
-    for s in curves.values():
-        common_idx = common_idx.intersection(s.index)
+        if debug:
+            s = model_rets[name]
+            print(f"[DEBUG] {name}: first_valid={s.first_valid_index()}, last_valid={s.last_valid_index()}")
 
-    if len(common_idx) == 0:
-        raise ValueError("No common dates across model curves and W100 after alignment.")
-        
-    # Plot
+    if w100_ret is None:
+        raise ValueError("No baseline W100 return series built.")
+
+    # --- common sample across all model returns + W100 ---
+    R = pd.DataFrame({**model_rets, w100_label: w100_ret}).dropna(how="any")
+    if R.empty:
+        raise ValueError("No common dates across models and W100 after dropna().")
+
+    # --- now compound wealth on the common sample ---
+    curves = {}
+    for name in model_rets.keys():
+        curves[name] = (1.0 + R[name]).cumprod() - 1.0
+
+    w100_curve = (1.0 + R[w100_label]).cumprod() - 1.0
+
+    # print total returns on exactly the plotted sample
+    for name in curves:
+        print(f"{name} total return (plotted sample): {curves[name].iloc[-1]:.2%}")
+    print(f"{w100_label} total return (plotted sample): {w100_curve.iloc[-1]:.2%}")
+
+    # --- plot ---
+    common_idx = R.index
+
     plt.figure(figsize=figsize)
     plt.grid(True)
-    # model lines
-    for name, s in curves.items():
-        plt.plot(common_idx, s.reindex(common_idx).values, linewidth=model_lw, label=name)
 
-    # single baseline: W100
-    plt.plot(
-        common_idx,
-        w100_curve.reindex(common_idx).values,
-        linewidth=w100_lw,
-        label=w100_label,
-    )
+    for name, s in curves.items():
+        plt.plot(common_idx, s.values, linewidth=model_lw, label=name)
+
+    plt.plot(common_idx, w100_curve.values, linewidth=w100_lw, label=w100_label)
 
     plt.axhline(0.0, linewidth=1.0)
     plt.title(title)
@@ -140,23 +143,27 @@ def plot_regression_timing_total_return_models(
     vol_window: int = 60,
     w_min: float = 0.0,
     w_max: float = 1.5,
-    baselines: list[str] | None = None,   # e.g. ["HA", "50", "100"]
+    baselines: list[str] | None = None,   # any subset of ["HA","50","100"]
     title: str = "Regression: cumulative total return (wealth − 1)",
     figsize=(12, 6),
     model_lw: float = 1.8,
     baseline_lw: float = 1.6,
+    start_date: str | None = None,        # e.g. "2017-01-01" to match your summary loop
+    debug: bool = False,
+    lag = 0,
 ):
     """
     Plots cumulative total return (wealth-1) for multiple regression/timing models,
     plus selected baselines from: ["HA","50","100"].
 
-    model_pred_cols: dict like {"PCR": "y_pred_pcr_Completed", "Chronos-2": "y_pred_Chronos_2_forecast", ...}
+    IMPORTANT: Wealth is compounded AFTER aligning all strategies to a common sample.
+    This avoids inflated curves when different models start earlier.
 
-    Requires your existing backtest_timing_strategy() and helper functions to be in scope:
-      - backtest_timing_strategy (returns columns: rf, r_excess, var, port_total, port_excess, mkt_total, ...)
+    Requires backtest_timing_strategy() to be in scope (you have it as tsh.backtest_timing_strategy).
     """
+
     if baselines is None:
-        baselines = ["100"]  # default to market / 100% equity exposure baseline
+        baselines = ["100"]
 
     # Normalize baseline tokens
     base_set = {str(b).strip().upper() for b in baselines}
@@ -164,6 +171,9 @@ def plot_regression_timing_total_return_models(
     bad = sorted(list(base_set - allowed))
     if bad:
         raise ValueError(f"Unknown baselines {bad}. Use any of {sorted(list(allowed))}.")
+
+    if not isinstance(model_pred_cols, dict) or len(model_pred_cols) == 0:
+        raise ValueError("model_pred_cols must be a non-empty dict: {name: pred_col}")
 
     # Basic checks
     need = [target_col, rf_col]
@@ -175,17 +185,26 @@ def plot_regression_timing_total_return_models(
         if col not in df.columns:
             raise ValueError(f"Prediction column for '{name}' not found: '{col}'")
 
-    # Ensure datetime index if you have a timestamp column
+    # Ensure datetime index
     d0 = df.copy()
-    
     if "timestamp" in d0.columns:
         d0["timestamp"] = pd.to_datetime(d0["timestamp"])
         d0 = d0.sort_values("timestamp").set_index("timestamp")
     else:
         d0 = d0.sort_index()
+        if not isinstance(d0.index, pd.DatetimeIndex):
+            # try to coerce
+            try:
+                d0.index = pd.to_datetime(d0.index)
+                d0 = d0.sort_index()
+            except Exception as e:
+                raise ValueError("df must have a DatetimeIndex or a 'timestamp' column") from e
 
-    # ---------- Build model curves ----------
-    curves = {}
+    if start_date is not None:
+        d0 = d0.loc[d0.index >= pd.to_datetime(start_date)]
+
+    # ---------- 1) Build MODEL RETURN series (not wealth) ----------
+    model_rets = {}
     bt_first = None
 
     for name, pred_col in model_pred_cols.items():
@@ -199,70 +218,87 @@ def plot_regression_timing_total_return_models(
             vol_window=vol_window,
             w_min=w_min,
             w_max=w_max,
+            lag = lag,
         )
 
-        # Keep first bt for baseline construction (same sample rules)
         if bt_first is None:
             bt_first = bt
 
-        # Model wealth curve
-        model_wealth = (1.0 + bt["port_total"].astype(float)).cumprod()
-        curves[name] = (model_wealth - 1.0)
+        model_rets[name] = bt["port_total"].astype(float)
+
+        if debug:
+            s = model_rets[name]
+            print(f"[DEBUG] {name}: first_valid={s.first_valid_index()}, last_valid={s.last_valid_index()}")
 
     if bt_first is None:
-        raise ValueError("No models provided.")
+        raise ValueError("No models provided / no backtests produced.")
 
-    # ---------- Build selected baseline curves on the SAME bt_first sample ----------
-    base_curves = {}
-    bt_first = bt_first.dropna()
-    r_excess = bt_first["r_excess"].astype(float)
+    # ---------- 2) Build BASELINE RETURN series (on same bt_first space) ----------
+    bt_first = bt_first.copy()
+
+    # Use these for HA/50/100 construction
     rf = bt_first["rf"].astype(float)
+    r_excess = bt_first["r_excess"].astype(float)
 
-    # IMPORTANT: align and drop NaNs ONCE (common sample)
-    base_mat = pd.DataFrame({"rf": rf, "r_excess": r_excess}).dropna()
-    idx0 = base_mat.index
-    rf = base_mat["rf"]
-    r_excess = base_mat["r_excess"]
+    base_rets = {}
 
-    # 100% equity exposure (w=1): total return = rf + r_excess
     if "100" in base_set:
-        w100_total = (rf + r_excess).astype(float)
-        w100_wealth = (1.0 + w100_total).cumprod()
-        base_curves["W100"] = (w100_wealth - 1.0)
+        base_rets["W100"] = (rf + r_excess).astype(float)
 
-    # 50/50 exposure
     if "50" in base_set:
-        w50_total = (rf + 0.5 * r_excess).astype(float)
-        w50_wealth = (1.0 + w50_total).cumprod()
-        base_curves["W50"] = (w50_wealth - 1.0)
+        base_rets["W50"] = (rf + 0.5 * r_excess).astype(float)
 
-    # HA timing (needs var + expanding mean; align to idx0 first)
     if "HA" in base_set:
-        var = bt_first["var"].astype(float).reindex(idx0)
+        # Align pieces first
+        var = bt_first["var"].astype(float)
+        # prevailing mean of realized excess, lagged
         mu = r_excess.expanding(min_periods=vol_window).mean().shift(1)
         w_ha = (mu / (gamma * var)).clip(w_min, w_max)
-        ha_total = rf + (w_ha * r_excess)
-        ha_wealth = (1.0 + ha_total).cumprod()
-        base_curves["HA"] = (ha_wealth - 1.0)
+        base_rets["HA"] = (rf + w_ha * r_excess).astype(float)
 
-    # ---------- Align everything to common dates ----------
-    common_idx = None
-    all_series = list(curves.values()) + list(base_curves.values())
-    for s in all_series:
-        common_idx = s.index if common_idx is None else common_idx.intersection(s.index)
+    # ---------- 3) Common sample across ALL strategies ----------
+    all_series = []
+    all_names = []
 
-    if common_idx is None or len(common_idx) == 0:
-        raise ValueError("No common dates after alignment (check NaNs / vol_window warmup).")
+    for name, s in model_rets.items():
+        all_series.append(s.rename(name))
+        all_names.append(name)
 
-    # ---------- Plot ----------
+    for name, s in base_rets.items():
+        all_series.append(s.rename(name))
+        all_names.append(name)
+
+    Rmat = pd.concat(all_series, axis=1).dropna(how="any")
+    if Rmat.empty:
+        raise ValueError(
+            "After aligning on a common sample, no dates remain. "
+            "This usually means vol_window warmup + NaNs in predictions leave no overlap."
+        )
+
+    common_idx = Rmat.index
+
+    if debug:
+        print(f"[DEBUG] common sample: {common_idx.min()} -> {common_idx.max()}  (n={len(common_idx)})")
+
+    # ---------- 4) Compound wealth FROM the common start ----------
+    model_curves = {}
+    for name in model_pred_cols.keys():
+        r = Rmat[name].astype(float)
+        model_curves[name] = (1.0 + r).cumprod() - 1.0
+
+    base_curves = {}
+    for bname in base_rets.keys():
+        r = Rmat[bname].astype(float)
+        base_curves[bname] = (1.0 + r).cumprod() - 1.0
+
+    # ---------- 5) Plot ----------
     plt.figure(figsize=figsize)
 
-    for name, s in curves.items():
-        plt.plot(common_idx, s.reindex(common_idx).values, linewidth=model_lw, label=name)
+    for name, s in model_curves.items():
+        plt.plot(common_idx, s.values, linewidth=model_lw, label=name)
 
-    # Baselines (dashed)
     for name, s in base_curves.items():
-        plt.plot(common_idx, s.reindex(common_idx).values, linewidth=baseline_lw, linestyle="--", label=name)
+        plt.plot(common_idx, s.values, linewidth=baseline_lw, linestyle="--", label=name)
 
     plt.axhline(0.0, linewidth=1.0)
     plt.title(title)
@@ -273,4 +309,9 @@ def plot_regression_timing_total_return_models(
     plt.tight_layout()
     plt.show()
 
-
+    # Optional: print ending total returns (should match your TotalReturn on same sample)
+    if debug:
+        for name, s in model_curves.items():
+            print(f"[DEBUG] {name} end wealth-1: {float(s.iloc[-1]):.6f}")
+        for name, s in base_curves.items():
+            print(f"[DEBUG] {name} end wealth-1: {float(s.iloc[-1]):.6f}")
