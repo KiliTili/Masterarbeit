@@ -413,7 +413,11 @@ def bootstrap_refit_train_test(
             ytr = train_star_full[target_col].to_numpy(float)
             Xte = df_test[feature_cols].to_numpy(float)
             yhat = pcr_fit_predict_batch(Xtr, ytr, Xte, k=pcr_k)
-
+        elif model == "tabpfn":
+            Xtr = train_star_full[feature_cols].to_numpy(float)
+            ytr = train_star_full[target_col].to_numpy(float)
+            Xte = df_test[feature_cols].to_numpy(float)
+            yhat = tabpfn_fit_predict_batch(Xtr, ytr, Xte, seed=seed + b, model_params="2.5")
         elif model == "combo":
             feat_map = _infer_feat_map(feature_cols)
             preds = []
