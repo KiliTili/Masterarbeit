@@ -196,7 +196,7 @@ def plot_regression_timing_total_return_models(
     plt.yticks(fontsize=TICK_FONTSIZE)
 
     plt.legend(fontsize=LEGEND_FONTSIZE)
-    plt.grid(True)
+    #plt.grid(True)
     plt.tight_layout()
     plt.show()
 
@@ -351,10 +351,10 @@ def plot_regime_models_total_return(
 
     if log_scale:
         y = wealth
-        ylab = "Wealth (log scale)"
+        ylab = "log(TR+1)"
     else:
         y = wealth - 1.0
-        ylab = "Total return (wealth − 1)"
+        ylab = "Total return (TR)"
 
     # print totals on the plotted sample
     end_vals = (wealth.iloc[-1] - 1.0).sort_values(ascending=False)
@@ -379,7 +379,7 @@ def plot_regime_models_total_return(
     
     plt.ylabel(ylab)
     plt.xlabel("Date")
-    plt.grid(True, linestyle=":", linewidth=0.8)
+    #plt.grid(True, linestyle=":", linewidth=0.8)
     plt.legend()
     plt.tight_layout()
     plt.show()
