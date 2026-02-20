@@ -484,8 +484,8 @@ def expanding_oos_tabular(
         "total_predictions": len(preds),
     }
     #calculate hit rate meaning preds>0 & trues >0
-    a = ct_eval_summary(trues, preds, oos_r2=r2, cutoff=0.0)
-    print(f"CT Eval Summary: {a}")
+    # a = ct_eval_summary(trues, preds, oos_r2=r2, cutoff=0.0)
+    # print(f"CT Eval Summary: {a}")
     r2,stats = evaluate_oos(trues, preds, y_bench=HA, model_name=model_name, quiet=quiet)
     if add_to_csv:
         
@@ -502,8 +502,8 @@ def expanding_oos_tabular(
             "r2std": [stats_wct['std']],
             "r2lower": [stats_wct['lower']],
             "r2upper": [stats_wct['upper']],   
-            "hit_spread": [a['timing_spread']],
-            "hit_share": [a['share_in_market']],
+            # "hit_spread": [a['timing_spread']],
+            # "hit_share": [a['share_in_market']],
         })
         csv_file = "oos_results_regressionNow.csv"
         try:

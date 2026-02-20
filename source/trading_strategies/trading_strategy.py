@@ -123,7 +123,24 @@ def backtest_timing_strategy(
     out["port_excess"] = port_excess
     out["port_total"] = port_total
     out["turnover"] = out["w"].diff().abs()
+    valid = out["w"].notna() & r_excess.notna()
+    w_valid = out.loc[valid, "w"].astype(float)
+    y_valid = r_excess.loc[valid].astype(float)
 
+    in_mkt = w_valid > 0.0          # or > 0.5 if w is 0/1 but float noise possible
+    share_in_market = float(in_mkt.mean())
+
+    y_in = y_valid.loc[in_mkt]
+    y_out = y_valid.loc[~in_mkt]
+
+    mean_in = float(y_in.mean()) if len(y_in) else np.nan
+    mean_out = float(y_out.mean()) if len(y_out) else np.nan
+    timing_spread = float(mean_in - mean_out) if np.isfinite(mean_in) and np.isfinite(mean_out) else np.nan
+
+    print(
+        f"Timing spread (mean excess in vs out of market): {timing_spread:.4f} "
+        f"(share in market: {share_in_market:.2%}, n={valid.sum()})"
+    )
     # Optional: implied market total return (useful for W100 checks)
     out["mkt_total"] = rf + r_excess
     #out = out.dropna(subset=["w"])
@@ -352,7 +369,9 @@ def backtest_paper_regime_switch(
     tc_bps: float = 0.0,
     ts_col: str = "timestamp",
     bear_label = 1,
-    lag: int = 0
+    lag: int = 0,
+    periods_per_year: int = 252,
+    
 ):
     d = df.copy()
 
@@ -403,4 +422,18 @@ def backtest_paper_regime_switch(
     for col in ["strategy_net", "buy_hold_eq", "buy_hold_rf", "static_50_50"]:
         out[col + "_curve"] = (1 + out[col]).cumprod()
 
+    r_excess = (out["buy_hold_eq"] - out["buy_hold_rf"]).astype(float)    
+    in_mkt = out["w"].astype(float) > 0.5
+    share_in_market = float(in_mkt.mean())
+    y_in = r_excess.loc[in_mkt]
+    y_out = r_excess.loc[~in_mkt]
+
+    mean_in = float(y_in.mean()) if len(y_in) else np.nan
+    mean_out = float(y_out.mean()) if len(y_out) else np.nan
+    timing_spread = float(mean_in - mean_out) if np.isfinite(mean_in) and np.isfinite(mean_out) else np.nan
+    print(f"Timing spread (mean excess in vs out of market): {timing_spread:.4f} (share in market: {share_in_market:.2%})")
+
     return out
+
+
+
