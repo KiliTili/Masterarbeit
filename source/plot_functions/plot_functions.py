@@ -118,7 +118,7 @@ def plot_oos(
             raise ValueError("events=True requires `dates` (datetime-like) so event windows can be placed correctly.")  
         _add_event_windows(ax, x, events)  
         
-    ax.set_title(title)
+#    ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xlabel("Date" if dates is not None else "OOS step")
     ax.grid(True, alpha=0.3)

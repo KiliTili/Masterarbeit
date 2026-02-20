@@ -1,6 +1,66 @@
 import numpy as np
 import pandas as pd
+import pandas as pd
 
+def merge_risk_free_rates(
+    pred_df: pd.DataFrame,
+    df: pd.DataFrame,
+    ts_col: str = "timestamp",
+    rf_cols: list[str] = ["FEDL01_O", "EUR003M_O"],
+    how: str = "left",
+    normalize: bool = True,
+    drop_na_ts: bool = True
+) -> pd.DataFrame:
+    """
+    Merge risk-free rate columns from df into pred_df by timestamp.
+
+    Parameters
+    ----------
+    pred_df : pd.DataFrame
+        DataFrame containing model predictions and timestamps.
+    df : pd.DataFrame
+        DataFrame containing risk-free rate series and timestamps.
+    ts_col : str
+        Name of the timestamp column.
+    rf_cols : list[str]
+        Columns to merge from df (e.g. FEDL01_O, EUR003M_O).
+    how : str
+        Merge type (default: left).
+    normalize : bool
+        Normalize timestamps to midnight before merge.
+    drop_na_ts : bool
+        Drop rows with unparseable timestamps.
+
+    Returns
+    -------
+    pd.DataFrame
+        pred_df with risk-free columns merged in.
+    """
+
+    pred = pred_df.copy()
+    base = df.copy()
+
+    # Parse timestamps
+    pred[ts_col] = pd.to_datetime(pred[ts_col], errors="coerce")
+    base[ts_col] = pd.to_datetime(base[ts_col], errors="coerce")
+
+    if normalize:
+        pred[ts_col] = pred[ts_col].dt.normalize()
+        base[ts_col] = base[ts_col].dt.normalize()
+
+    if drop_na_ts:
+        pred = pred.dropna(subset=[ts_col])
+        base = base.dropna(subset=[ts_col])
+
+    cols_to_merge = [ts_col] + rf_cols
+
+    pred = pred.merge(
+        base[cols_to_merge],
+        on=ts_col,
+        how=how
+    )
+
+    return pred
 
 def build_arith_excess_from_target(df, target_col, rf_col="Rfree", uselog=False):
     rf = df[rf_col].astype(float)
@@ -278,6 +338,10 @@ def compare_regime_strategies(
     return summary
 
 
+def annual_percent_to_period_return(rate_percent: pd.Series, periods_per_year: int = 252) -> pd.Series:
+    r = pd.to_numeric(rate_percent, errors="coerce")
+    r_dec = r / 100.0
+    return (1.0 + r_dec) ** (1.0 / periods_per_year) - 1.0
 
 def backtest_paper_regime_switch(
     df: pd.DataFrame,
@@ -287,7 +351,7 @@ def backtest_paper_regime_switch(
     rf_const: float = 0.0,
     tc_bps: float = 0.0,
     ts_col: str = "timestamp",
-    bear_label: str = "bear",
+    bear_label = 1,
     lag: int = 0
 ):
     d = df.copy()
@@ -298,7 +362,9 @@ def backtest_paper_regime_switch(
     r_eq_fwd = price.pct_change().shift(-1)
 
     if rf_col is not None and rf_col in d.columns:
-        rf = pd.to_numeric(d[rf_col], errors="coerce").fillna(rf_const)
+        #rf = pd.to_numeric(d[rf_col], errors="coerce").fillna(rf_const)
+        rf  = annual_percent_to_period_return(d[rf_col], periods_per_year=252)
+        
     else:
         rf = pd.Series(rf_const, index=d.index, dtype=float)
     r_rf_fwd = rf.shift(-1)
@@ -308,7 +374,8 @@ def backtest_paper_regime_switch(
     if reg.dtype == "O":
         is_bear = reg.astype(str).str.lower().eq(str(bear_label).lower())
     else:
-        is_bear = reg.astype(float).fillna(0.0).astype(int).eq(bear_label)
+        is_bear = reg.astype(int).eq(bear_label)
+
 
     w = (~is_bear).astype(float)   # bull=1 (equity), bear=0 (cash)
     w = w.shift(lag) 

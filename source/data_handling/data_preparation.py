@@ -126,7 +126,7 @@ def create_classification_data(file_path="../../Data/GoyalAndWelch.xlsx", quiet=
     df_diff = difference_over_variables(df.copy())
     df_diff['timestamp'] = pd.to_datetime(df_diff['timestamp'])
     df_diff = df_diff.merge(
-        df[["timestamp", "M1WO"]].rename(columns={"M1WO": "M1WO_O"}),
+        df[["timestamp", "M1WO", "FEDL01", "EUR003M"]].rename(columns={"M1WO": "M1WO_O", "FEDL01": "FEDL01_O", "EUR003M": "EUR003M_O"}),
         on="timestamp",
         how="left"
     )
