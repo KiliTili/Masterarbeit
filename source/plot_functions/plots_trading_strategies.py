@@ -8,129 +8,6 @@ import os, sys
 sys.path.insert(0, os.path.abspath('../..'))
 import source.data_handling.data_preparation as dp
 import source.trading_strategies.trading_strategy as tsh
-# df = dp.create_classification_data(quiet=False)
-# df["Rfree"] = 0
-
-
-def plot_total_return_models_vs_w100(
-    pred_dfs: dict,
-    df_mkt: pd.DataFrame,
-    *,
-    price_col: str = "M1WO_O",
-    rf_col: str | None = "Rfree",
-    regime_col: str = "y_pred",
-    tc_bps: float = 0.0,
-    bear_label=0,
-    title: str = "Cumulative total return (wealth − 1) — models vs W100",
-    figsize=(12, 6),
-    w100_label: str = "Buy & Hold Equity (W100)",
-    w100_lw: float = 2.4,
-    model_lw: float = 1.8,
-    start_date: str = "2010-01-01",
-    lag: int = 0,
-    debug: bool = False,
-):
-    if not isinstance(pred_dfs, dict) or len(pred_dfs) == 0:
-        raise ValueError("pred_dfs must be a non-empty dict: {name: pred_df}.")
-
-    df_m = df_mkt.copy()
-    df_m["timestamp"] = pd.to_datetime(df_m["timestamp"])
-
-    need_cols = ["timestamp", price_col] + ([rf_col] if (rf_col is not None) else [])
-    missing = [c for c in need_cols if c not in df_m.columns]
-    if missing:
-        raise ValueError(f"df_mkt missing columns: {missing}")
-
-    df_m = (
-        df_m[need_cols]
-        .dropna(subset=[price_col])
-        .sort_values("timestamp")
-        .set_index("timestamp")
-    )
-
-    df_m = df_m[df_m.index >= pd.to_datetime(start_date)]
-
-    # --- collect RETURN series first ---
-    model_rets = {}
-    w100_ret = None
-
-    for name, pred_df in pred_dfs.items():
-        d = pred_df.copy()
-        if "timestamp" not in d.columns:
-            raise ValueError(f"pred_df for '{name}' must contain a 'timestamp' column.")
-        if regime_col not in d.columns:
-            raise ValueError(f"pred_df for '{name}' missing regime_col='{regime_col}'.")
-
-        d["timestamp"] = pd.to_datetime(d["timestamp"])
-        d = d.sort_values("timestamp").set_index("timestamp")
-
-        d_merge = d[[regime_col]].merge(df_m, left_index=True, right_index=True, how="inner")
-        d_merge = d_merge[d_merge.index >= pd.to_datetime(start_date)]
-        if d_merge.empty:
-            raise ValueError(f"No overlap in dates between pred_df '{name}' and df_mkt.")
-
-        bt = tsh.backtest_paper_regime_switch(
-            d_merge,
-            price_col=price_col,
-            regime_col=regime_col,
-            rf_col=rf_col,
-            tc_bps=tc_bps,
-            bear_label=bear_label,
-            lag=lag,
-        )
-
-        model_rets[name] = bt["strategy_net"].astype(float)
-
-        if w100_ret is None:
-            w100_ret = bt["buy_hold_eq"].astype(float)
-
-        if debug:
-            s = model_rets[name]
-            print(f"[DEBUG] {name}: first_valid={s.first_valid_index()}, last_valid={s.last_valid_index()}")
-
-    if w100_ret is None:
-        raise ValueError("No baseline W100 return series built.")
-
-    # --- common sample across all model returns + W100 ---
-    R = pd.DataFrame({**model_rets, w100_label: w100_ret}).dropna(how="any")
-    if R.empty:
-        raise ValueError("No common dates across models and W100 after dropna().")
-
-    # --- now compound wealth on the common sample ---
-    curves = {}
-    for name in model_rets.keys():
-        curves[name] = (1.0 + R[name]).cumprod() - 1.0
-
-    w100_curve = (1.0 + R[w100_label]).cumprod() - 1.0
-
-    # print total returns on exactly the plotted sample
-    for name in curves:
-        print(f"{name} total return (plotted sample): {curves[name].iloc[-1]:.2%}")
-    print(f"{w100_label} total return (plotted sample): {w100_curve.iloc[-1]:.2%}")
-
-    # --- plot ---
-    common_idx = R.index
-
-    plt.figure(figsize=figsize)
-    plt.grid(True)
-
-    for name, s in curves.items():
-        plt.plot(common_idx, s.values, linewidth=model_lw, label=name)
-
-    plt.plot(common_idx, w100_curve.values, linewidth=w100_lw, label=w100_label)
-
-    plt.axhline(0.0, linewidth=1.0)
-    plt.title(title)
-    plt.ylabel("Total return (wealth − 1)")
-    plt.xlabel("Date")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 
 def plot_regression_timing_total_return_models(
     df: pd.DataFrame,
@@ -144,13 +21,14 @@ def plot_regression_timing_total_return_models(
     w_min: float = 0.0,
     w_max: float = 1.5,
     baselines: list[str] | None = None,   # any subset of ["HA","50","100"]
-    title: str = "Regression: cumulative total return (wealth − 1)",
     figsize=(12, 6),
     model_lw: float = 1.8,
     baseline_lw: float = 1.6,
     start_date: str | None = None,        # e.g. "2017-01-01" to match your summary loop
     debug: bool = False,
     lag = 0,
+    log_scale = False,
+    ylab = "Total return"
 ):
     """
     Plots cumulative total return (wealth-1) for multiple regression/timing models,
@@ -161,6 +39,10 @@ def plot_regression_timing_total_return_models(
 
     Requires backtest_timing_strategy() to be in scope (you have it as tsh.backtest_timing_strategy).
     """
+    # Match TabPFN/missingness plot typography
+    LABEL_FONTSIZE = 11
+    TICK_FONTSIZE = 10
+    LEGEND_FONTSIZE = 10
 
     if baselines is None:
         baselines = ["100"]
@@ -295,16 +177,25 @@ def plot_regression_timing_total_return_models(
     plt.figure(figsize=figsize)
 
     for name, s in model_curves.items():
-        plt.plot(common_idx, s.values, linewidth=model_lw, label=name)
+        if log_scale:
+            s = np.log(s.values + 1)
+        plt.plot(common_idx, s, linewidth=model_lw, label=name)
 
     for name, s in base_curves.items():
-        plt.plot(common_idx, s.values, linewidth=baseline_lw, linestyle="--", label=name)
+        if log_scale:
+            s = np.log(s.values + 1)
+        plt.plot(common_idx, s, linewidth=baseline_lw, linestyle="--", label=name)
 
-    plt.axhline(0.0, linewidth=1.0)
-    plt.title(title)
+    #plt.axhline(0.0, linewidth=1.0)
     plt.ylabel("Total return (wealth − 1)")
     plt.xlabel("Date")
     plt.legend()
+    plt.ylabel(ylab, fontsize=LABEL_FONTSIZE)
+    plt.xlabel("Date", fontsize=LABEL_FONTSIZE)
+    plt.xticks(fontsize=TICK_FONTSIZE)
+    plt.yticks(fontsize=TICK_FONTSIZE)
+
+    plt.legend(fontsize=LEGEND_FONTSIZE)
     plt.grid(True)
     plt.tight_layout()
     plt.show()
@@ -315,3 +206,182 @@ def plot_regression_timing_total_return_models(
             print(f"[DEBUG] {name} end wealth-1: {float(s.iloc[-1]):.6f}")
         for name, s in base_curves.items():
             print(f"[DEBUG] {name} end wealth-1: {float(s.iloc[-1]):.6f}")
+
+
+def plot_regime_models_total_return(
+    pred_dfs: dict,
+    df_mkt: pd.DataFrame,
+    *,
+    price_col: str = "M1WO_O",
+    rf_rate_col: str | None = "FEDL01_O",   # this is an ANNUAL % rate column (e.g., 4.12 means 4.12%)
+    regime_col: str = "y_pred",
+    tc_bps: float = 0.0,
+    bear_label: int = 1,                    # bull=0, bear=1
+    start_date: str = "2010-01-01",
+    lag: int = 0,
+    baselines: list[str] | None = None,     # any subset of ["100","50","RF","HA"]
+    log_scale: bool = False,
+    figsize=(12, 6),
+    model_lw: float = 1.8,
+    baseline_lw: float = 1.6,
+    gamma: float = 5.0,                     # HA only
+    vol_window: int = 60,                   # HA only
+    w_min: float = 0.0,                     # HA only
+    w_max: float = 1.5,                     # HA only
+    debug: bool = False,
+):
+    """
+    Plots regime-switch strategies for multiple models and consistent baselines.
+
+    Key points:
+    - Uses forward returns (t -> t+1) stored at time t, consistent with your backtest.
+    - Converts rf_rate_col (annual % rate) into per-period return via annual_percent_to_period_return.
+    - Aligns all series on a common date index BEFORE compounding.
+    """
+
+    if baselines is None:
+        baselines = ["100"]
+
+    base_set = {str(b).strip().upper() for b in baselines}
+    allowed = {"100", "50", "RF", "HA"}
+    bad = sorted(list(base_set - allowed))
+    if bad:
+        raise ValueError(f"Unknown baselines {bad}. Use any subset of {sorted(list(allowed))}.")
+
+    if not isinstance(pred_dfs, dict) or len(pred_dfs) == 0:
+        raise ValueError("pred_dfs must be a non-empty dict: {name: pred_df}.")
+
+    # --- prepare market frame ---
+    df_m = df_mkt.copy()
+    if "timestamp" not in df_m.columns:
+        raise ValueError("df_mkt must contain a 'timestamp' column.")
+
+    df_m["timestamp"] = pd.to_datetime(df_m["timestamp"], errors="coerce").dt.normalize()
+    df_m = df_m.dropna(subset=["timestamp", price_col]).sort_values("timestamp").set_index("timestamp")
+
+    if rf_rate_col is not None:
+        if rf_rate_col not in df_m.columns:
+            raise ValueError(f"df_mkt missing rf_rate_col='{rf_rate_col}'.")
+        rf_rate = pd.to_numeric(df_m[rf_rate_col], errors="coerce")
+        rf_period = tsh.annual_percent_to_period_return(rf_rate, periods_per_year=252)
+    else:
+        rf_period = pd.Series(0.0, index=df_m.index)
+
+    df_m = df_m[df_m.index >= pd.to_datetime(start_date)]
+    rf_period = rf_period.reindex(df_m.index)
+
+    if df_m.empty:
+        raise ValueError("df_mkt has no data after start_date.")
+
+    # --- build consistent baseline returns using SAME forward convention as backtest ---
+    price = pd.to_numeric(df_m[price_col], errors="coerce")
+    r_eq_fwd = price.pct_change().shift(-1)     # return from t -> t+1 stored at t
+    r_rf_fwd = rf_period.shift(-1)              # rf return from t -> t+1 stored at t
+
+    base_rets = {}
+    if "100" in base_set:
+        base_rets["W100"] = r_eq_fwd
+    if "RF" in base_set:
+        base_rets["RF"] = r_rf_fwd
+    if "50" in base_set:
+        base_rets["W50"] = 0.5 * r_eq_fwd + 0.5 * r_rf_fwd
+    if "HA" in base_set:
+        # Excess return series consistent with forward timing
+        r_excess = (r_eq_fwd - r_rf_fwd)
+
+        # Estimate variance from realized excess returns (rolling)
+        var = r_excess.rolling(vol_window).var()
+        mu = r_excess.expanding(min_periods=vol_window).mean().shift(1)
+
+        var_safe = var.replace(0.0, np.nan)
+        w_ha = (mu / (gamma * var_safe)).clip(w_min, w_max).fillna(0.0)
+
+        base_rets["HA"] = r_rf_fwd + w_ha * r_excess
+
+    # --- build model return series via your backtest ---
+    model_rets = {}
+
+    for name, pred_df in pred_dfs.items():
+        d = pred_df.copy()
+        if "timestamp" not in d.columns:
+            raise ValueError(f"pred_df for '{name}' must contain a 'timestamp' column.")
+        if regime_col not in d.columns:
+            raise ValueError(f"pred_df for '{name}' missing regime_col='{regime_col}'.")
+
+        d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce").dt.normalize()
+        d = d.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
+
+        # merge only needed columns, inner join to avoid mismatched calendars
+        d_merge = d[[regime_col]].merge(df_m[[price_col]], left_index=True, right_index=True, how="inner")
+        # attach the rf *rate* column if provided so your backtest can convert internally (or pass rf_col=None)
+        if rf_rate_col is not None:
+            d_merge[rf_rate_col] = df_m.loc[d_merge.index, rf_rate_col]
+
+        if d_merge.empty:
+            raise ValueError(f"No overlap in dates between pred_df '{name}' and df_mkt after start_date.")
+
+        bt = tsh.backtest_paper_regime_switch(
+            d_merge,
+            price_col=price_col,
+            regime_col=regime_col,
+            rf_col=rf_rate_col,          # annual % rate col; your backtest converts it
+            tc_bps=tc_bps,
+            bear_label=bear_label,       # IMPORTANT: bear=1
+            lag=lag,
+        )
+
+        model_rets[name] = bt["strategy_net"].astype(float)
+
+        if debug:
+            s = model_rets[name]
+            print(f"[DEBUG] {name}: {s.first_valid_index()} -> {s.last_valid_index()} (n={s.dropna().shape[0]})")
+
+    # --- align EVERYTHING on a common sample BEFORE compounding ---
+    series_list = [s.rename(k) for k, s in model_rets.items()] + [s.rename(k) for k, s in base_rets.items()]
+    R = pd.concat(series_list, axis=1).dropna(how="any")
+
+    if R.empty:
+        raise ValueError("No common dates across models/baselines after alignment/dropna().")
+
+    if debug:
+        print(f"[DEBUG] common sample: {R.index.min()} -> {R.index.max()} (n={len(R)})")
+
+    # --- compound ---
+    wealth = (1.0 + R).cumprod()
+
+    if log_scale:
+        y = wealth
+        ylab = "Wealth (log scale)"
+    else:
+        y = wealth - 1.0
+        ylab = "Total return (wealth − 1)"
+
+    # print totals on the plotted sample
+    end_vals = (wealth.iloc[-1] - 1.0).sort_values(ascending=False)
+    print("Total return on plotted sample:")
+    for k, v in end_vals.items():
+        print(f"  {k}: {v:.2%}")
+
+    # --- plot ---
+    plt.figure(figsize=figsize)
+    for name in model_rets.keys():
+        plt.plot(R.index, y[name].values, linewidth=model_lw, label=name)
+
+    # baselines dashed
+    for bname in base_rets.keys():
+        plt.plot(R.index, y[bname].values, linewidth=baseline_lw, linestyle="--", label=bname)
+
+    if log_scale:
+        plt.yscale("log")
+    #else:
+    #    plt.axhline(0.0, linewidth=1.0)
+
+    
+    plt.ylabel(ylab)
+    plt.xlabel("Date")
+    plt.grid(True, linestyle=":", linewidth=0.8)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return {"R": R, "wealth": wealth}
